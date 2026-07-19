@@ -1,10 +1,85 @@
-#include "app/Application.h"
-#include "ui/MainWindow.h"
+#include "MainWindow.h"
+
+#include <QApplication>
+#include <QFile>
+#include <QFont>
+#include <QCoreApplication>
+#include <QComboBox>
+#include <QAbstractItemView>
+#include <QPixmap>
+#include <QPainter>
+#include <QEventLoop>
+#include <QProxyStyle>
+#include <QScreen>
+#include <QStyleFactory>
+#include <QTimer>
+
+namespace {
+class StableFusionStyle final : public QProxyStyle
+{
+public:
+    StableFusionStyle() : QProxyStyle(QStyleFactory::create(QStringLiteral("Fusion"))) {}
+
+    int styleHint(StyleHint hint, const QStyleOption *option = nullptr,
+                  const QWidget *widget = nullptr,
+                  QStyleHintReturn *returnData = nullptr) const override
+    {
+        if (hint == QStyle::SH_Widget_Animate || hint == QStyle::SH_ScrollBar_Transient ||
+            hint == QStyle::SH_ComboBox_Popup)
+            return 0;
+        return QProxyStyle::styleHint(hint, option, widget, returnData);
+    }
+};
+}
 
 int main(int argc, char *argv[])
 {
-    vsdb::Application application(argc, argv);
+    QApplication app(argc, argv);
+    QApplication::setApplicationName(QStringLiteral("VsDB"));
+    QApplication::setOrganizationName(QStringLiteral("VsDB"));
+    QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QApplication::setStyle(new StableFusionStyle);
+
+    QFont font(QStringLiteral("Segoe UI"));
+    font.setPointSize(10);
+    app.setFont(font);
+
+    QFile theme(QCoreApplication::applicationDirPath() + QStringLiteral("/theme.qss"));
+    if (theme.open(QIODevice::ReadOnly))
+        app.setStyleSheet(QString::fromUtf8(theme.readAll()));
+
+    QString screenshotPath = qEnvironmentVariable("VSDB_SCREENSHOT");
+    const QStringList arguments = QCoreApplication::arguments();
+    const int screenshotArgument = arguments.indexOf(QStringLiteral("--screenshot"));
+    if (screenshotPath.isEmpty() && screenshotArgument >= 0 && screenshotArgument + 1 < arguments.size())
+        screenshotPath = arguments.at(screenshotArgument + 1);
+
     vsdb::MainWindow window;
+    if (!screenshotPath.isEmpty()) {
+        window.resize(1560, 920);
+        window.show();
+        QEventLoop paintLoop;
+        QTimer::singleShot(400, &paintLoop, &QEventLoop::quit);
+        paintLoop.exec();
+        const bool openCombo = qEnvironmentVariableIsSet("VSDB_OPEN_COMBO");
+        if (openCombo) {
+            if (auto *combo = window.findChild<QComboBox *>(QStringLiteral("rowLimitCombo")))
+                combo->showPopup();
+            QEventLoop popupLoop;
+            QTimer::singleShot(120, &popupLoop, &QEventLoop::quit);
+            popupLoop.exec();
+        }
+        QPixmap snapshot = window.grab();
+        if (openCombo) {
+            if (auto *combo = window.findChild<QComboBox *>(QStringLiteral("rowLimitCombo"))) {
+                QWidget *popup = combo->view()->window();
+                QPainter painter(&snapshot);
+                painter.drawPixmap(window.mapFromGlobal(popup->mapToGlobal(QPoint(0, 0))),
+                                   popup->grab());
+            }
+        }
+        return snapshot.save(screenshotPath, "PNG") ? 0 : 2;
+    }
     window.show();
-    return application.exec();
+    return app.exec();
 }

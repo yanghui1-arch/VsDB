@@ -1,117 +1,47 @@
 # VsDB
 
-VsDB is a low-memory-oriented, native database visualization workbench built with Qt 6 and CMake.
+VsDB 是一个以低内存占用和快速交互为目标的原生数据库可视化 GUI。
 
-> **Current status:** this first milestone implements the interface from [issue #1](https://github.com/yanghui1-arch/VsDB/issues/1) with deterministic preview data. It does **not** connect to a real database, execute SQL, or store credentials yet.
+当前版本实现了 [Issue #1](https://github.com/yanghui1-arch/VsDB/issues/1) 的高保真工作台原型：连接浏览器、SQL 编辑器、结果表格、对象检查器、查询标签页、搜索、快捷键和持久化布局。数据为确定性的演示数据；本里程碑尚未连接真实数据库。
 
-## Preview features
+## 技术选择
 
-- Compact three-column workbench: connection explorer, SQL workspace, and object inspector
-- Multiple closable query tabs with resizable editor/results areas
-- Results and Messages views backed by Qt model/view classes
-- Recursive connection-tree filtering and table-to-query navigation
-- Shared menu/toolbar commands and keyboard shortcuts
-- Honest mock execution state, row count, timing, and connection status
-- Persisted window, splitter, and pane visibility settings
-- A polished light theme with bundled project-owned SVG icons
+- C++20 + Qt 6 Widgets，保持原生启动速度和较小运行时开销。
+- `QAbstractTableModel` 按需生成演示单元格，不为表格中的每个单元创建 QWidget。
+- 查询执行使用事件循环定时器模拟异步完成，界面线程不会阻塞。
+- 使用 Qt 自带的树、表格、分割器、标签页和样式系统，不引入额外 UI 框架或动态依赖。
 
-## Why Qt Widgets
+## Windows 构建与启动
 
-The shell uses Qt Widgets because VsDB is a dense, keyboard-friendly desktop tool built around trees, tables, splitters, menus, and native window behavior. `QTreeView` and `QTableView` render through models instead of allocating a widget per database cell. This keeps the UI layer compact and leaves a direct path to bounded, paged result models when real database execution is added.
-
-## Requirements
-
-- CMake 3.21 or newer
-- A C++20 compiler
-- Qt 6.5 or newer with `Core`, `Gui`, `Widgets`, and (for tests) `Test`
-- Ninja is recommended, but any CMake generator compatible with your Qt installation works
-
-The compiler ABI must match the Qt kit (for example, use an MSVC Qt kit with MSVC).
-
-## Build, test, and run
-
-### Ninja / single-config generators
-
-```sh
-cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH=/path/to/Qt/6.x/your-kit
-cmake --build build
-ctest --test-dir build --output-on-failure
-./build/src/VsDB
-```
-
-On Windows, the executable is `build/src/VsDB.exe`.
-
-If Qt is already discoverable through `Qt6_DIR`, `CMAKE_PREFIX_PATH`, or your toolchain, omit `-DCMAKE_PREFIX_PATH`.
-
-### Visual Studio / multi-config generators
+需要 CMake 3.21+、Qt 6.5+ 和与 Qt 套件匹配的 C++ 编译器。仓库当前开发环境使用 Qt 6.9.2 MinGW：
 
 ```powershell
-cmake -S . -B build
-cmake --build build --config Debug
-ctest --test-dir build -C Debug --output-on-failure
-.\build\src\Debug\VsDB.exe
+C:\Qt\Tools\CMake_64\bin\cmake.exe -S . -B build -G "MinGW Makefiles" `
+  -DCMAKE_PREFIX_PATH=C:\Qt\6.9.2\mingw_64 `
+  -DCMAKE_CXX_COMPILER=C:\Qt\Tools\mingw1310_64\bin\g++.exe `
+  -DCMAKE_MAKE_PROGRAM=C:\Qt\Tools\mingw1310_64\bin\mingw32-make.exe `
+  -DBUILD_TESTING=ON
+C:\Qt\Tools\CMake_64\bin\cmake.exe --build build --parallel 4
+$env:PATH = "C:\Qt\6.9.2\mingw_64\bin;C:\Qt\Tools\mingw1310_64\bin;$env:PATH"
+C:\Qt\Tools\CMake_64\bin\ctest.exe --test-dir build --output-on-failure
+.\build\VsDB.exe
 ```
 
-### Qt Creator
+如果要把程序复制到没有 Qt 开发环境的机器，再执行：
 
-1. Open the root `CMakeLists.txt`.
-2. Select a Qt 6.5+ desktop kit.
-3. Configure the project.
-4. Build and run the `VsDB` target.
-
-## Architecture
-
-```text
-MainWindow and pane widgets
-          │
-          ▼
-  WorkspaceController
-    │       │       │
-    ▼       ▼       ▼
- schema   result  inspector
-  model    model    model
-          │
-          ▼
- future bounded query/session service
+```powershell
+C:\Qt\6.9.2\mingw_64\bin\windeployqt.exe build\VsDB.exe
 ```
 
-- **`src/core`** contains compact value types and centralized deterministic preview data.
-- **`src/models`** contains read-only `QAbstractItemModel` implementations. Views do not own or materialize database cells as widgets.
-- **`src/app/WorkspaceController`** coordinates selection and preview execution. It is the seam where a future thread-aware query/session service will be introduced.
-- **`src/ui`** contains focused, composable widgets. `CommandRegistry` creates each `QAction` once for menus, toolbar controls, shortcuts, and state.
-- **`resources`** contains target-bundled icons and styling, so runtime behavior does not depend on the working directory.
-- **`tests`** checks model contracts and key workbench interactions using Qt Test.
+如果使用 Qt Creator，直接打开根目录的 `CMakeLists.txt`，选择 Qt 6.5+ Desktop Kit 后运行 `VsDB` target。
 
-Qt parent-child ownership manages UI and model lifetimes. Models are owned by the controller, panes are owned by the main window, and shared actions are owned by the command registry. User layout preferences are stored with `QSettings`; query results and credentials are not persisted.
+## 原型交互
 
-The project starts with internal CMake targets rather than a dynamic plugin API. Database/provider boundaries will be designed once real backend requirements are known, avoiding an unstable premature ABI.
+- `Ctrl+Enter` 执行当前 SQL，`Esc` 可停止模拟执行。
+- `Ctrl+T` 新建查询，`Ctrl+W` 关闭当前查询。
+- 双击连接树中的表会创建对应的查询。
+- 拖动三栏和编辑器/结果区之间的分隔线，布局会在退出时保存。
 
-## Scope and next steps
+## 后续里程碑
 
-This branch intentionally uses small, bounded preview data. Real database support will require:
-
-- connection profiles and secure credential storage
-- thread-local database connections and cancellable background execution
-- bounded result batches with `canFetchMore()` / `fetchMore()`
-- server-side sorting and filtering for large results
-- SQL editor services such as highlighting, completion, and diagnostics
-- driver deployment and integration tests
-
-No performance number is claimed before representative backend benchmarks exist.
-
-## Qt references
-
-The architecture follows the official documentation for:
-
-- [Qt Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html)
-- [Qt and CMake](https://doc.qt.io/qt-6/cmake-get-started.html)
-- [Model/View Programming](https://doc.qt.io/qt-6/model-view-programming.html)
-- [Object Trees & Ownership](https://doc.qt.io/qt-6/objecttrees.html)
-- [QMainWindow](https://doc.qt.io/qt-6/qmainwindow.html)
-- [The Qt Resource System](https://doc.qt.io/qt-6/resources.html)
-- [QSettings](https://doc.qt.io/qt-6/qsettings.html)
-- [Qt Test](https://doc.qt.io/qt-6/qttest-index.html)
-
-## License
-
-[MIT](LICENSE)
+真实数据库连接需要增加后台连接池、可取消的工作线程任务、凭据安全存储，以及基于 `fetchMore()` 的分页结果模型。这些边界已在 UI 原型中保留，但不在 Issue #1 的布局范围内。
