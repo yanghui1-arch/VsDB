@@ -9,7 +9,8 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg Sql)
+set(CMAKE_AUTOMOC ON)
 
 qt_add_executable(VsDB
     src/main.cpp
@@ -21,11 +22,22 @@ qt_add_executable(VsDB
     src/UiComponents.h
     src/WorkbenchModels.cpp
     src/WorkbenchModels.h
+    src/database/DatabaseTypes.h
+    src/database/postgres/PostgresSession.cpp
+    src/database/postgres/PostgresSession.h
+    src/ui/IconProvider.cpp
+    src/ui/IconProvider.h
+    src/ui/PostgresConnectionDialog.cpp
+    src/ui/PostgresConnectionDialog.h
+    src/ui/QueryPage.cpp
+    src/ui/QueryPage.h
 )
+
+target_include_directories(VsDB PRIVATE src)
 
 configure_file(resources/theme.qss theme.qss COPYONLY)
 
-target_link_libraries(VsDB PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg)
+target_link_libraries(VsDB PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::Sql)
 add_custom_command(TARGET VsDB POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:Qt6::Svg> $<TARGET_FILE_DIR:VsDB>
@@ -86,4 +98,14 @@ if(BUILD_TESTING)
     target_link_libraries(VsDBTests PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
     add_test(NAME VsDB.WorkbenchModels COMMAND VsDBTests)
     set_tests_properties(VsDB.WorkbenchModels PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_executable(VsDBPostgresTests
+        tests/PostgresSessionTest.cpp
+        src/database/DatabaseTypes.h
+        src/database/postgres/PostgresSession.cpp
+        src/database/postgres/PostgresSession.h
+    )
+    target_include_directories(VsDBPostgresTests PRIVATE src)
+    target_link_libraries(VsDBPostgresTests PRIVATE Qt6::Core Qt6::Sql)
+    add_test(NAME VsDB.PostgresSession COMMAND VsDBPostgresTests)
 endif()

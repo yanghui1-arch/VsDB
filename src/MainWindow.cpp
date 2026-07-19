@@ -3,59 +3,59 @@
 #include "SqlEditor.h"
 #include "UiComponents.h"
 #include "WorkbenchModels.h"
+#include "ui/IconProvider.h"
+#include "ui/PostgresConnectionDialog.h"
+#include "ui/QueryPage.h"
 
 #include <QAction>
 #include <QApplication>
-#include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
-#include <QElapsedTimer>
-#include <QFileDialog>
+#include <QEventLoop>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHeaderView>
+#include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLabel>
-#include <QMessageBox>
 #include <QMenu>
-#include <QPushButton>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPaintEvent>
+#include <QPushButton>
 #include <QResizeEvent>
 #include <QSettings>
 #include <QSortFilterProxyModel>
 #include <QSplitter>
-#include <QStandardItemModel>
 #include <QStackedWidget>
+#include <QStandardItemModel>
+#include <QStatusBar>
 #include <QStyleOptionTab>
 #include <QStylePainter>
 #include <QTabBar>
 #include <QTableView>
-#include <QTimer>
+#include <QTextDocument>
 #include <QToolBar>
-#include <QSvgRenderer>
 #include <QToolButton>
 #include <QTreeView>
 #include <QVBoxLayout>
 
+#include <utility>
+
 namespace vsdb {
 
 namespace {
+
+constexpr int NameRole = Qt::UserRole;
 constexpr int TypeRole = Qt::UserRole + 1;
+constexpr int SchemaRole = Qt::UserRole + 2;
+constexpr int LoadedRole = Qt::UserRole + 3;
 
 const QString kInitialSql = QStringLiteral(
     "SELECT\n"
-    "    u.id,\n"
-    "    u.email,\n"
-    "    u.created_at,\n"
-    "    o.id AS order_id,\n"
-    "    o.total,\n"
-    "    o.status\n"
-    "FROM public.users u\n"
-    "LEFT JOIN public.orders o ON o.user_id = u.id\n"
-    "WHERE u.created_at >= '2026-07-01'\n"
-    "ORDER BY u.created_at DESC\n"
-    "LIMIT 100;");
+    "    current_database() AS database,\n"
+    "    current_user AS user_name,\n"
+    "    version() AS server_version;");
 
 QToolButton *plainButton(QWidget *parent, const QString &text, const QString &tip)
 {
@@ -67,33 +67,51 @@ QToolButton *plainButton(QWidget *parent, const QString &text, const QString &ti
     return button;
 }
 
-QIcon toolbarIcon(const QString &name);
+QIcon toolbarIcon(const QString &name)
+{
+    return databaseIcon(name);
+}
 
-QStandardItem *schemaItem(const QString &text, const QString &type, const QString &iconName)
+QStandardItem *schemaItem(const QString &text, const QString &type,
+                          const QString &iconName = {}, const QString &name = {},
+                          const QString &schema = {}, bool lazy = false)
 {
     auto *item = new QStandardItem(text);
     if (!iconName.isEmpty())
         item->setIcon(toolbarIcon(iconName));
+    item->setData(name.isEmpty() ? text : name, NameRole);
     item->setData(type, TypeRole);
-    item->setData(text, Qt::UserRole);
+    item->setData(schema, SchemaRole);
+    item->setData(!lazy, LoadedRole);
     item->setEditable(false);
+    if (lazy) {
+        auto *loading = new QStandardItem(QStringLiteral("展开以加载…"));
+        loading->setData(QStringLiteral("loading"), TypeRole);
+        loading->setEditable(false);
+        item->appendRow(loading);
+    }
     return item;
 }
 
-QIcon toolbarIcon(const QString &name)
+void appendReadOnlyRow(QStandardItemModel *model, const QStringList &cells,
+                       const QString &icon = {})
 {
-    QSvgRenderer renderer(QStringLiteral(":/icons/") + name + QStringLiteral(".svg"));
-    QIcon icon;
-    for (const qreal dpr : {1.0, 2.0}) {
-        const int pixels = qRound(16 * dpr);
-        QPixmap pixmap(pixels, pixels);
-        pixmap.fill(Qt::transparent);
-        pixmap.setDevicePixelRatio(dpr);
-        QPainter painter(&pixmap);
-        renderer.render(&painter, QRectF(0, 0, 16, 16));
-        icon.addPixmap(pixmap);
+    QList<QStandardItem *> items;
+    for (const QString &cell : cells) {
+        auto *item = new QStandardItem(cell);
+        item->setEditable(false);
+        items.append(item);
     }
-    return icon;
+    if (!icon.isEmpty() && !items.isEmpty())
+        items.constFirst()->setIcon(toolbarIcon(icon));
+    model->appendRow(items);
+}
+
+QLabel *mutedLabel(const QString &text, QWidget *parent = nullptr)
+{
+    auto *label = new QLabel(text, parent);
+    label->setObjectName(QStringLiteral("muted"));
+    return label;
 }
 
 class SchemaTreeView final : public QTreeView
@@ -107,13 +125,8 @@ protected:
         painter->fillRect(rect, QColor(QStringLiteral("#1B1C23")));
         if (!model() || !model()->hasChildren(index))
             return;
-
         const QString iconName = isExpanded(index)
             ? QStringLiteral("chevron-down") : QStringLiteral("chevron-right");
-
-        // The final indentation slot belongs to the branch control. Keeping
-        // the chevron inside it prevents the indicator from crossing into the
-        // item rectangle painted with the selection/hover background.
         const QRect indicatorSlot(rect.right() - indentation() + 1,
                                   rect.top(), indentation(), rect.height());
         QRect iconRect(0, 0, 14, 14);
@@ -142,7 +155,6 @@ protected:
     {
         Q_UNUSED(event);
         QStylePainter painter(this);
-
         for (int index = 0; index < count(); ++index) {
             QStyleOptionTab option;
             initStyleOption(&option, index);
@@ -158,7 +170,6 @@ protected:
                 option.icon.paint(&painter, iconRect);
                 contentLeft = iconRect.right() + 7;
             }
-
             int contentRight = tabRect.right() - 8;
             if (const QWidget *closeButton = tabButton(index, QTabBar::RightSide))
                 contentRight = closeButton->geometry().left() - 5;
@@ -167,8 +178,7 @@ protected:
             titleFont.setBold(option.state.testFlag(QStyle::State_Selected));
             painter.setFont(titleFont);
             painter.setPen(option.state.testFlag(QStyle::State_Selected)
-                ? QColor(QStringLiteral("#E7E8ED"))
-                : QColor(QStringLiteral("#A3A6B2")));
+                ? QColor(QStringLiteral("#E7E8ED")) : QColor(QStringLiteral("#A3A6B2")));
             painter.drawText(QRect(contentLeft, tabRect.top(),
                                    qMax(0, contentRight - contentLeft + 1), tabRect.height()),
                              Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine,
@@ -205,47 +215,11 @@ private:
     int availableWidth_ = 0;
 };
 
-class ResultRowHeaderView final : public QHeaderView
-{
-public:
-    explicit ResultRowHeaderView(QTableView *table)
-        : QHeaderView(Qt::Vertical, table), table_(table)
-    {
-        setSectionsClickable(true);
-        setHighlightSections(true);
-        setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    }
-
-protected:
-    void paintSection(QPainter *painter, const QRect &rect, int logicalIndex) const override
-    {
-        if (!rect.isValid())
-            return;
-
-        const bool selected = table_->selectionModel()
-            && table_->selectionModel()->isRowSelected(logicalIndex, QModelIndex{});
-        painter->save();
-        painter->fillRect(rect, selected ? QColor(QStringLiteral("#173A5E"))
-                                         : QColor(QStringLiteral("#24252E")));
-        painter->setPen(QColor(QStringLiteral("#30323C")));
-        painter->drawLine(rect.topRight(), rect.bottomRight());
-        painter->drawLine(rect.bottomLeft(), rect.bottomRight());
-        painter->setPen(selected ? QColor(QStringLiteral("#E7E8ED"))
-                                 : QColor(QStringLiteral("#B7BAC5")));
-        painter->drawText(rect.adjusted(10, 0, -6, 0),
-                          Qt::AlignLeft | Qt::AlignVCenter,
-                          model()->headerData(logicalIndex, orientation(), Qt::DisplayRole).toString());
-        painter->restore();
-    }
-
-private:
-    QTableView *table_ = nullptr;
-};
-
 class QueryTabWidget final : public QTabWidget
 {
 public:
     using QTabWidget::QTabWidget;
+
     void installTabBar(AdaptiveQueryTabBar *bar)
     {
         adaptiveBar_ = bar;
@@ -264,204 +238,11 @@ private:
     AdaptiveQueryTabBar *adaptiveBar_ = nullptr;
 };
 
-QLabel *mutedLabel(const QString &text, QWidget *parent = nullptr)
-{
-    auto *label = new QLabel(text, parent);
-    label->setObjectName(QStringLiteral("muted"));
-    return label;
-}
-}
-
-class QueryPage final : public QWidget
-{
-public:
-    explicit QueryPage(const QString &sql, QWidget *parent = nullptr) : QWidget(parent)
-    {
-        setObjectName(QStringLiteral("queryPage"));
-        auto *root = new QVBoxLayout(this);
-        root->setContentsMargins(0, 0, 0, 0);
-        root->setSpacing(0);
-
-        splitter = new QSplitter(Qt::Vertical, this);
-        editor = new SqlEditor(splitter);
-        editor->setPlainText(sql);
-        splitter->addWidget(editor);
-
-        auto *results = new QWidget(splitter);
-        auto *resultsLayout = new QVBoxLayout(results);
-        resultsLayout->setContentsMargins(10, 0, 10, 8);
-        resultsLayout->setSpacing(0);
-
-        auto *resultTabs = new QTabBar(results);
-        resultTabs->setDrawBase(false);
-        resultTabs->addTab(QStringLiteral("Results 1"));
-        resultTabs->addTab(QStringLiteral("Messages"));
-        resultTabs->setCurrentIndex(0);
-        resultTabs->setExpanding(false);
-        resultsLayout->addWidget(resultTabs);
-
-        auto *tools = new QWidget(results);
-        tools->setFixedHeight(50);
-        auto *toolLayout = new QHBoxLayout(tools);
-        toolLayout->setContentsMargins(0, 7, 0, 7);
-        toolLayout->setSpacing(7);
-        auto *gridButton = plainButton(tools, QString{}, QStringLiteral("Grid view"));
-        gridButton->setIcon(toolbarIcon(QStringLiteral("layout-grid")));
-        auto *recordButton = plainButton(tools, QString{}, QStringLiteral("Record view"));
-        recordButton->setIcon(toolbarIcon(QStringLiteral("rows-3")));
-        toolLayout->addWidget(gridButton);
-        toolLayout->addWidget(recordButton);
-        auto *exportButton = new QPushButton(toolbarIcon(QStringLiteral("upload")), QStringLiteral("Export"), tools);
-        exportButton->setToolTip(QStringLiteral("Export visible results"));
-        toolLayout->addSpacing(6);
-        toolLayout->addWidget(exportButton);
-        auto *copyButton = new QPushButton(toolbarIcon(QStringLiteral("copy")), QStringLiteral("Copy"), tools);
-        toolLayout->addWidget(copyButton);
-        toolLayout->addSpacing(6);
-        commitButton = new QPushButton(toolbarIcon(QStringLiteral("save")), QStringLiteral("Commit"), tools);
-        commitButton->setToolTip(QStringLiteral("Commit all pending cell edits in one transaction"));
-        commitButton->setEnabled(false);
-        toolLayout->addWidget(commitButton);
-        rollbackButton = new QPushButton(toolbarIcon(QStringLiteral("undo-2")), QStringLiteral("Rollback"), tools);
-        rollbackButton->setToolTip(QStringLiteral("Discard all pending cell edits"));
-        rollbackButton->setEnabled(false);
-        toolLayout->addWidget(rollbackButton);
-        toolLayout->addStretch();
-        rowLimit = new ModernComboBox(tools);
-        rowLimit->setObjectName(QStringLiteral("rowLimitCombo"));
-        rowLimit->addItems({QStringLiteral("50 rows"), QStringLiteral("100 rows"), QStringLiteral("500 rows")});
-        rowLimit->setCurrentIndex(1);
-        rowLimit->setFixedWidth(112);
-        toolLayout->addWidget(rowLimit);
-        auto *settingsButton = plainButton(tools, QString{}, QStringLiteral("Result settings"));
-        settingsButton->setIcon(toolbarIcon(QStringLiteral("settings")));
-        toolLayout->addWidget(settingsButton);
-        resultsLayout->addWidget(tools);
-
-        model = new ResultTableModel(this);
-        table = new QTableView(results);
-        table->setHorizontalHeader(new TwoLineHeaderView(Qt::Horizontal, table));
-        table->setVerticalHeader(new ResultRowHeaderView(table));
-        table->setModel(model);
-        table->setAlternatingRowColors(true);
-        table->setSelectionBehavior(QAbstractItemView::SelectItems);
-        table->setSelectionMode(QAbstractItemView::ExtendedSelection);
-        table->setEditTriggers(QAbstractItemView::DoubleClicked);
-        table->setSortingEnabled(false);
-        table->verticalHeader()->setDefaultSectionSize(37);
-        table->verticalHeader()->setMinimumWidth(38);
-        table->horizontalHeader()->setFixedHeight(49);
-        table->horizontalHeader()->setStretchLastSection(true);
-        table->setColumnWidth(0, 70);
-        table->setColumnWidth(1, 175);
-        table->setColumnWidth(2, 160);
-        table->setColumnWidth(3, 90);
-        table->setColumnWidth(4, 90);
-        table->setColumnWidth(5, 130);
-        resultsLayout->addWidget(table, 1);
-
-        summary = new QLabel(QStringLiteral("Ready · 100 rows available"), results);
-        summary->setObjectName(QStringLiteral("muted"));
-        summary->setContentsMargins(4, 5, 0, 0);
-        resultsLayout->addWidget(summary);
-
-        splitter->addWidget(results);
-        splitter->setChildrenCollapsible(false);
-        splitter->setStretchFactor(0, 2);
-        splitter->setStretchFactor(1, 3);
-        splitter->setSizes({320, 450});
-        root->addWidget(splitter);
-
-        connect(table->verticalHeader(), &QHeaderView::sectionClicked, this, [this](int row) {
-            table->setCurrentIndex(model->index(row, 0));
-            const QItemSelection entireRow(model->index(row, 0),
-                                           model->index(row, model->columnCount() - 1));
-            table->selectionModel()->select(entireRow, QItemSelectionModel::ClearAndSelect);
-        });
-        connect(table->selectionModel(), &QItemSelectionModel::selectionChanged,
-                table->verticalHeader()->viewport(), qOverload<>(&QWidget::update));
-        connect(model, &QAbstractItemModel::dataChanged, this, [this] {
-            updateTransactionState();
-        });
-        connect(commitButton, &QPushButton::clicked, this, [this] {
-            const int changes = model->pendingChangeCount();
-            if (changes <= 0)
-                return;
-            model->commitPendingChanges();
-            summary->setText(QStringLiteral("Committed %1 edit%2 in one transaction")
-                                 .arg(changes)
-                                 .arg(changes == 1 ? QString{} : QStringLiteral("s")));
-        });
-        connect(rollbackButton, &QPushButton::clicked, this, [this] {
-            const int changes = model->pendingChangeCount();
-            if (changes <= 0)
-                return;
-            model->rollbackPendingChanges();
-            summary->setText(QStringLiteral("Rolled back %1 pending edit%2")
-                                 .arg(changes)
-                                 .arg(changes == 1 ? QString{} : QStringLiteral("s")));
-        });
-
-        connect(rowLimit, &QComboBox::currentIndexChanged, this, [this](int index) {
-            const int rows[] = {50, 100, 500};
-            model->setVisibleRows(rows[index]);
-            updateTransactionState();
-        });
-        connect(copyButton, &QPushButton::clicked, this, [this] {
-            const QModelIndexList selected = table->selectionModel()->selectedIndexes();
-            if (selected.isEmpty())
-                return;
-            QString text;
-            int lastRow = selected.constFirst().row();
-            for (const QModelIndex &index : selected) {
-                if (!text.isEmpty())
-                    text += index.row() == lastRow ? QLatin1Char('\t') : QLatin1Char('\n');
-                text += index.data().toString();
-                lastRow = index.row();
-            }
-            QApplication::clipboard()->setText(text);
-        });
-        connect(exportButton, &QPushButton::clicked, this, [this] {
-            summary->setText(QStringLiteral("Export is available when a database session is connected"));
-        });
-        connect(resultTabs, &QTabBar::currentChanged, this, [this](int index) {
-            table->setVisible(index == 0);
-            if (index == 0)
-                updateTransactionState();
-            else
-                summary->setText(QStringLiteral("Query completed without messages"));
-        });
-    }
-
-    void updateTransactionState()
-    {
-        const int changes = model->pendingChangeCount();
-        commitButton->setEnabled(changes > 0);
-        rollbackButton->setEnabled(changes > 0);
-        commitButton->setText(changes > 0
-            ? QStringLiteral("Commit (%1)").arg(changes)
-            : QStringLiteral("Commit"));
-        summary->setText(changes > 0
-            ? QStringLiteral("%1 pending edit%2 · Commit applies all edits in one transaction")
-                  .arg(changes)
-                  .arg(changes == 1 ? QString{} : QStringLiteral("s"))
-            : QStringLiteral("Ready · %1 rows available").arg(model->rowCount()));
-    }
-
-    SqlEditor *editor = nullptr;
-    ResultTableModel *model = nullptr;
-    QTableView *table = nullptr;
-    QSplitter *splitter = nullptr;
-    QLabel *summary = nullptr;
-    QComboBox *rowLimit = nullptr;
-    QPushButton *commitButton = nullptr;
-    QPushButton *rollbackButton = nullptr;
-    QElapsedTimer elapsed;
-};
+} // namespace
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 {
-    setWindowTitle(QStringLiteral("VsDB — Fast database workbench"));
+    setWindowTitle(QStringLiteral("VsDB — PostgreSQL 数据库工作台"));
     setMinimumSize(1100, 680);
     resize(1560, 920);
     createDatabaseToolBar();
@@ -487,21 +268,50 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     populateSchema();
     installActions();
     addQuery(kInitialSql);
-    updateInspector(QStringLiteral("users"), QStringLiteral("Table"));
-
-    executionTimer_ = new QTimer(this);
-    executionTimer_->setSingleShot(true);
-    connect(executionTimer_, &QTimer::timeout, this, [this] {
-        QueryPage *page = currentQuery();
-        if (!page)
-            return;
-        const qint64 ms = qMax<qint64>(16, page->elapsed.elapsed());
-        page->summary->setText(QStringLiteral("Query completed · %1 rows · %2 ms").arg(page->model->rowCount()).arg(ms));
-    });
+    updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+    updateConnectionUi();
 
     QSettings settings;
     restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
     mainSplitter_->restoreState(settings.value(QStringLiteral("window/mainSplitter")).toByteArray());
+}
+
+bool MainWindow::connectToPostgres(const PostgresConnectionConfig &config, QString *error)
+{
+    if (!postgres_.connectToServer(config, error))
+        return false;
+    updateConnectionUi();
+    populateSchema();
+    updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+    return true;
+}
+
+bool MainWindow::openRelationPreview(const QString &schema, const QString &relation,
+                                     QString *error)
+{
+    if (!postgres_.isConnected()) {
+        if (error)
+            *error = QStringLiteral("PostgreSQL 尚未连接。");
+        return false;
+    }
+
+    const DatabaseTable table = postgres_.describeTable(schema, relation, error);
+    if (error && !error->isEmpty())
+        return false;
+    const QString sql = QStringLiteral("SELECT *\nFROM %1\nLIMIT 100;")
+                            .arg(postgres_.qualifiedName(schema, relation));
+    addQuery(sql);
+    QueryPage *page = currentQuery();
+    const bool editable = !table.primaryKeys().isEmpty();
+    if (editable)
+        page->setTableContext(schema, relation, table.primaryKeys());
+    page->beginExecution();
+    QueryResult result = postgres_.execute(sql, page->rowLimit(), error);
+    if (error && !error->isEmpty())
+        return false;
+    page->setQueryResult(std::move(result), editable);
+    updateInspector(table);
+    return true;
 }
 
 void MainWindow::createDatabaseToolBar()
@@ -514,8 +324,7 @@ void MainWindow::createDatabaseToolBar()
     toolbar->setToolButtonStyle(Qt::ToolButtonIconOnly);
     addToolBar(Qt::TopToolBarArea, toolbar);
 
-    auto addAction = [toolbar](const QString &icon, const QString &text,
-                               const QString &tip) {
+    auto addAction = [toolbar](const QString &icon, const QString &text, const QString &tip) {
         QAction *action = toolbar->addAction(toolbarIcon(icon), text);
         action->setToolTip(tip);
         return action;
@@ -523,28 +332,45 @@ void MainWindow::createDatabaseToolBar()
 
     auto *newConnection = new QToolButton(toolbar);
     newConnection->setIcon(toolbarIcon(QStringLiteral("database-zap")));
-    newConnection->setToolTip(QStringLiteral("New connection"));
+    newConnection->setToolTip(QStringLiteral("新建 PostgreSQL 连接"));
     newConnection->setPopupMode(QToolButton::MenuButtonPopup);
     auto *connectionMenu = new QMenu(newConnection);
-    connectionMenu->addAction(QStringLiteral("PostgreSQL"));
-    connectionMenu->addAction(QStringLiteral("MySQL"));
-    connectionMenu->addAction(QStringLiteral("Redis"));
+    QAction *postgresAction = connectionMenu->addAction(
+        toolbarIcon(QStringLiteral("postgresql")), QStringLiteral("PostgreSQL"));
+    connect(postgresAction, &QAction::triggered, this, &MainWindow::showPostgresConnectionDialog);
+    connect(newConnection, &QToolButton::clicked, this, &MainWindow::showPostgresConnectionDialog);
     newConnection->setMenu(connectionMenu);
     toolbar->addWidget(newConnection);
 
-    addAction(QStringLiteral("cloud-cog"), QStringLiteral("Manage connections"),
-              QStringLiteral("Manage connections"));
-    addAction(QStringLiteral("folder-open"), QStringLiteral("Open project"),
-              QStringLiteral("Open database project"));
+    QAction *manage = addAction(QStringLiteral("cloud-cog"), QStringLiteral("连接设置"),
+                                QStringLiteral("编辑 PostgreSQL 连接"));
+    connect(manage, &QAction::triggered, this, &MainWindow::showPostgresConnectionDialog);
     toolbar->addSeparator();
 
-    addAction(QStringLiteral("plug"), QStringLiteral("Connect"),
-              QStringLiteral("Connect"));
-    QAction *reconnect = addAction(QStringLiteral("refresh-cw"), QStringLiteral("Reconnect"),
-                                   QStringLiteral("Reconnect and refresh"));
-    connect(reconnect, &QAction::triggered, this, &MainWindow::refreshSchema);
-    addAction(QStringLiteral("unplug"), QStringLiteral("Disconnect"),
-              QStringLiteral("Disconnect"));
+    QAction *connectAction = addAction(QStringLiteral("plug"), QStringLiteral("连接"),
+                                       QStringLiteral("连接 PostgreSQL"));
+    connect(connectAction, &QAction::triggered, this, &MainWindow::showPostgresConnectionDialog);
+    reconnectAction_ = addAction(QStringLiteral("refresh-cw"), QStringLiteral("重新连接"),
+                                 QStringLiteral("重新连接并刷新结构"));
+    connect(reconnectAction_, &QAction::triggered, this, [this] {
+        QString error;
+        if (!postgres_.reconnect(&error)) {
+            showDatabaseError(QStringLiteral("重新连接失败"), error);
+            return;
+        }
+        updateConnectionUi();
+        populateSchema();
+        statusBar()->showMessage(QStringLiteral("PostgreSQL 已重新连接"), 4000);
+    });
+    disconnectAction_ = addAction(QStringLiteral("unplug"), QStringLiteral("断开连接"),
+                                  QStringLiteral("断开 PostgreSQL 连接"));
+    connect(disconnectAction_, &QAction::triggered, this, [this] {
+        postgres_.disconnect();
+        updateConnectionUi();
+        populateSchema();
+        updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+        statusBar()->showMessage(QStringLiteral("PostgreSQL 已断开"), 4000);
+    });
     toolbar->addSeparator();
 
     auto *sqlMenuButton = new QToolButton(toolbar);
@@ -553,50 +379,28 @@ void MainWindow::createDatabaseToolBar()
     sqlMenuButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     sqlMenuButton->setPopupMode(QToolButton::InstantPopup);
     auto *sqlMenu = new QMenu(sqlMenuButton);
-    QAction *runSql = sqlMenu->addAction(QStringLiteral("Run SQL    Ctrl+Enter"));
+    QAction *runSql = sqlMenu->addAction(QStringLiteral("执行 SQL    Ctrl+Enter"));
     connect(runSql, &QAction::triggered, this, &MainWindow::executeQuery);
-    QAction *newSql = sqlMenu->addAction(QStringLiteral("New SQL script    Ctrl+T"));
+    QAction *newSql = sqlMenu->addAction(QStringLiteral("新建 SQL 脚本    Ctrl+T"));
     connect(newSql, &QAction::triggered, this, [this] { addQuery(); });
     sqlMenuButton->setMenu(sqlMenu);
     toolbar->addWidget(sqlMenuButton);
-    toolbar->addSeparator();
-
-    QAction *newScript = addAction(QStringLiteral("file-plus"), QStringLiteral("New SQL script"),
-                                   QStringLiteral("New SQL script (Ctrl+T)"));
+    QAction *newScript = addAction(QStringLiteral("file-plus"), QStringLiteral("新建 SQL 脚本"),
+                                   QStringLiteral("新建 SQL 脚本（Ctrl+T）"));
     connect(newScript, &QAction::triggered, this, [this] { addQuery(); });
-    QAction *commit = addAction(QStringLiteral("save"), QStringLiteral("Commit"),
-                                QStringLiteral("Commit transaction"));
-    commit->setEnabled(false);
-    QAction *rollback = addAction(QStringLiteral("undo-2"), QStringLiteral("Rollback"),
-                                  QStringLiteral("Rollback transaction"));
-    rollback->setEnabled(false);
     toolbar->addSeparator();
 
-    auto *historyButton = new QToolButton(toolbar);
-    historyButton->setIcon(toolbarIcon(QStringLiteral("history")));
-    historyButton->setToolTip(QStringLiteral("Query history"));
-    historyButton->setPopupMode(QToolButton::InstantPopup);
-    auto *historyMenu = new QMenu(historyButton);
-    historyMenu->addAction(QStringLiteral("No query history yet"))->setEnabled(false);
-    historyButton->setMenu(historyMenu);
-    toolbar->addWidget(historyButton);
-    toolbar->addSeparator();
+    connectionContext_ = new ModernComboBox(toolbar);
+    connectionContext_->setObjectName(QStringLiteral("toolbarCombo"));
+    connectionContext_->setMinimumWidth(220);
+    connectionContext_->setEnabled(false);
+    toolbar->addWidget(connectionContext_);
 
-    auto *connectionContext = new ModernComboBox(toolbar);
-    connectionContext->setObjectName(QStringLiteral("toolbarCombo"));
-    connectionContext->addItem(toolbarIcon(QStringLiteral("postgresql")), QStringLiteral("PostgreSQL 15"));
-    connectionContext->addItem(toolbarIcon(QStringLiteral("mysql")), QStringLiteral("MySQL 8.0"));
-    connectionContext->addItem(toolbarIcon(QStringLiteral("redis")), QStringLiteral("Redis 7.2"));
-    connectionContext->setMinimumWidth(138);
-    toolbar->addWidget(connectionContext);
-
-    auto *schemaContext = new ModernComboBox(toolbar);
-    schemaContext->setObjectName(QStringLiteral("toolbarCombo"));
-    schemaContext->addItem(toolbarIcon(QStringLiteral("table-2")), QStringLiteral("public @ analytics"));
-    schemaContext->addItem(toolbarIcon(QStringLiteral("table-2")), QStringLiteral("analytics @ analytics"));
-    schemaContext->addItem(toolbarIcon(QStringLiteral("table-2")), QStringLiteral("staging @ analytics"));
-    schemaContext->setMinimumWidth(175);
-    toolbar->addWidget(schemaContext);
+    schemaContext_ = new ModernComboBox(toolbar);
+    schemaContext_->setObjectName(QStringLiteral("toolbarCombo"));
+    schemaContext_->setMinimumWidth(175);
+    schemaContext_->setEnabled(false);
+    toolbar->addWidget(schemaContext_);
 }
 
 QWidget *MainWindow::createExplorer()
@@ -628,21 +432,28 @@ QWidget *MainWindow::createExplorer()
     schemaTree_->setAnimated(false);
     schemaTree_->setIconSize(QSize(16, 16));
     schemaTree_->setIndentation(18);
-    schemaTree_->setContextMenuPolicy(Qt::CustomContextMenu);
     layout->addWidget(schemaTree_, 1);
 
     auto *footer = new QWidget(pane);
     footer->setFixedHeight(43);
     auto *footerLayout = new QHBoxLayout(footer);
     footerLayout->setContentsMargins(9, 3, 9, 3);
-    footerLayout->addWidget(plainButton(footer, QStringLiteral("＋"), QStringLiteral("Add connection")));
-    footerLayout->addWidget(plainButton(footer, QStringLiteral("⇧"), QStringLiteral("Import connections")));
-    footerLayout->addWidget(plainButton(footer, QStringLiteral("⌫"), QStringLiteral("Remove connection")));
+    QToolButton *add = plainButton(footer, QStringLiteral("＋"), QStringLiteral("添加 PostgreSQL 连接"));
+    QToolButton *refresh = plainButton(footer, QStringLiteral("↻"), QStringLiteral("刷新数据库结构"));
+    footerLayout->addWidget(add);
+    footerLayout->addWidget(refresh);
     footerLayout->addStretch();
     layout->addWidget(footer);
+    connect(add, &QToolButton::clicked, this, &MainWindow::showPostgresConnectionDialog);
+    connect(refresh, &QToolButton::clicked, this, &MainWindow::refreshSchema);
 
-    connect(schemaTree_->selectionModel(), &QItemSelectionModel::selectionChanged, this, &MainWindow::handleSchemaSelection);
+    connect(schemaTree_->selectionModel(), &QItemSelectionModel::selectionChanged,
+            this, &MainWindow::handleSchemaSelection);
     connect(schemaTree_, &QTreeView::doubleClicked, this, &MainWindow::activateSchemaItem);
+    connect(schemaTree_, &QTreeView::expanded, this, [this](const QModelIndex &proxyIndex) {
+        const QModelIndex sourceIndex = schemaProxy_->mapToSource(proxyIndex);
+        loadSchemaChildren(schemaModel_->itemFromIndex(sourceIndex));
+    });
     return pane;
 }
 
@@ -660,7 +471,6 @@ QWidget *MainWindow::createWorkspace()
     queryTabs_ = queryTabWidget;
     queryTabs_->setMinimumWidth(0);
     queryTabs_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
-    queryTabs_->setTabsClosable(false);
     queryTabs_->setMovable(true);
     queryTabs_->tabBar()->setObjectName(QStringLiteral("queryTabBar"));
     queryTabs_->tabBar()->setDrawBase(false);
@@ -669,7 +479,7 @@ QWidget *MainWindow::createWorkspace()
     queryTabs_->tabBar()->setFixedHeight(32);
     queryTabs_->tabBar()->setElideMode(Qt::ElideRight);
     queryTabs_->tabBar()->setUsesScrollButtons(false);
-    auto *add = plainButton(queryTabs_, QStringLiteral("＋"), QStringLiteral("New query (Ctrl+T)"));
+    auto *add = plainButton(queryTabs_, QStringLiteral("＋"), QStringLiteral("新建查询（Ctrl+T）"));
     add->setFixedSize(32, 30);
     queryTabs_->setCornerWidget(add, Qt::TopRightCorner);
     connect(add, &QToolButton::clicked, this, [this] { addQuery(); });
@@ -700,13 +510,11 @@ QWidget *MainWindow::createInspector()
     auto *bodyLayout = new QVBoxLayout(body);
     bodyLayout->setContentsMargins(16, 14, 16, 0);
     bodyLayout->setSpacing(12);
-
     auto *heading = new QWidget(body);
     auto *headingLayout = new QHBoxLayout(heading);
     headingLayout->setContentsMargins(0, 0, 0, 0);
     objectIcon_ = new QLabel(heading);
     objectIcon_->setObjectName(QStringLiteral("objectIcon"));
-    objectIcon_->setPixmap(toolbarIcon(QStringLiteral("table-2")).pixmap(QSize(20, 20)));
     objectIcon_->setAlignment(Qt::AlignCenter);
     objectIcon_->setFixedSize(46, 46);
     headingLayout->addWidget(objectIcon_);
@@ -714,14 +522,15 @@ QWidget *MainWindow::createInspector()
     auto *namesLayout = new QVBoxLayout(names);
     namesLayout->setContentsMargins(0, 0, 0, 0);
     namesLayout->setSpacing(1);
-    objectName_ = new QLabel(QStringLiteral("users"), names);
+    objectName_ = new QLabel(names);
     objectName_->setObjectName(QStringLiteral("paneHeading"));
-    objectType_ = mutedLabel(QStringLiteral("Table"), names);
+    objectType_ = mutedLabel({}, names);
     namesLayout->addWidget(objectName_);
     namesLayout->addWidget(objectType_);
     headingLayout->addWidget(names, 1);
     bodyLayout->addWidget(heading);
-    objectPath_ = mutedLabel(QStringLiteral("public.users"), body);
+    objectPath_ = mutedLabel({}, body);
+    objectPath_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     bodyLayout->addWidget(objectPath_);
 
     auto *details = new QWidget(body);
@@ -729,10 +538,13 @@ QWidget *MainWindow::createInspector()
     form->setContentsMargins(0, 3, 0, 3);
     form->setHorizontalSpacing(28);
     form->setVerticalSpacing(9);
-    rowEstimate_ = new QLabel(QStringLiteral("~ 10,248"), details);
+    rowEstimate_ = new QLabel(QStringLiteral("—"), details);
+    size_ = new QLabel(QStringLiteral("—"), details);
+    description_ = new QLabel(QStringLiteral("—"), details);
+    description_->setWordWrap(true);
     form->addRow(mutedLabel(QStringLiteral("Row estimate"), details), rowEstimate_);
-    form->addRow(mutedLabel(QStringLiteral("Size"), details), new QLabel(QStringLiteral("2.1 MB"), details));
-    form->addRow(mutedLabel(QStringLiteral("Description"), details), new QLabel(QStringLiteral("Application users"), details));
+    form->addRow(mutedLabel(QStringLiteral("Size"), details), size_);
+    form->addRow(mutedLabel(QStringLiteral("Description"), details), description_);
     bodyLayout->addWidget(details);
 
     auto *metadataTabs = new QTabWidget(body);
@@ -742,7 +554,8 @@ QWidget *MainWindow::createInspector()
     metadataTabs->tabBar()->setUsesScrollButtons(false);
     metadataTabs->tabBar()->setElideMode(Qt::ElideRight);
     columnModel_ = new QStandardItemModel(0, 4, metadataTabs);
-    columnModel_->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Type"), QStringLiteral("Nullable"), QStringLiteral("Default")});
+    columnModel_->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Type"),
+                                             QStringLiteral("Nullable"), QStringLiteral("Default")});
     auto *columns = new QTableView(metadataTabs);
     columns->setModel(columnModel_);
     columns->verticalHeader()->hide();
@@ -753,37 +566,36 @@ QWidget *MainWindow::createInspector()
     columns->setColumnWidth(2, 70);
     metadataTabs->addTab(columns, QStringLiteral("Columns"));
 
-    indexModel_ = new QStandardItemModel(0, 3, metadataTabs);
-    indexModel_->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Columns"), QStringLiteral("Type")});
+    indexModel_ = new QStandardItemModel(0, 2, metadataTabs);
+    indexModel_->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Definition")});
     auto *indexes = new QTableView(metadataTabs);
     indexes->setModel(indexModel_);
     indexes->verticalHeader()->hide();
     indexes->setShowGrid(false);
     indexes->setSelectionBehavior(QAbstractItemView::SelectRows);
-    indexes->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    indexes->setColumnWidth(1, 72);
-    indexes->setColumnWidth(2, 76);
+    indexes->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     metadataTabs->addTab(indexes, QStringLiteral("Indexes"));
 
-    foreignKeyModel_ = new QStandardItemModel(0, 3, metadataTabs);
-    foreignKeyModel_->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Column"), QStringLiteral("References")});
+    foreignKeyModel_ = new QStandardItemModel(0, 2, metadataTabs);
+    foreignKeyModel_->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Definition")});
     auto *foreignKeys = new QTableView(metadataTabs);
     foreignKeys->setModel(foreignKeyModel_);
     foreignKeys->verticalHeader()->hide();
     foreignKeys->setShowGrid(false);
     foreignKeys->setSelectionBehavior(QAbstractItemView::SelectRows);
-    foreignKeys->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    foreignKeys->setColumnWidth(1, 86);
-    foreignKeys->setColumnWidth(2, 106);
+    foreignKeys->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     metadataTabs->addTab(foreignKeys, QStringLiteral("Foreign Keys"));
     bodyLayout->addWidget(metadataTabs, 2);
+
     auto *pages = new QStackedWidget(pane);
     pages->addWidget(body);
     auto *historyPage = new QWidget(pages);
     historyPage->setObjectName(QStringLiteral("sidePane"));
+    auto *historyLayout = new QVBoxLayout(historyPage);
+    historyLayout->addWidget(mutedLabel(QStringLiteral("查询执行结果会显示在各查询页的 Messages 中。"), historyPage));
+    historyLayout->addStretch();
     pages->addWidget(historyPage);
     layout->addWidget(pages, 1);
-
     connect(topTabs, &QTabBar::currentChanged, pages, &QStackedWidget::setCurrentIndex);
     return pane;
 }
@@ -791,52 +603,125 @@ QWidget *MainWindow::createInspector()
 void MainWindow::populateSchema()
 {
     schemaModel_->clear();
-    auto *postgres = schemaItem(QStringLiteral("PostgreSQL 15"), QStringLiteral("connection"), QString{});
-    postgres->setIcon(toolbarIcon(QStringLiteral("postgresql")));
-    auto *databases = schemaItem(QStringLiteral("Databases"), QStringLiteral("group"), QStringLiteral("database"));
-    databases->appendRow(schemaItem(QStringLiteral("postgres"), QStringLiteral("database"), QStringLiteral("database")));
-    databases->appendRow(schemaItem(QStringLiteral("analytics"), QStringLiteral("database"), QStringLiteral("database")));
-    databases->appendRow(schemaItem(QStringLiteral("template1"), QStringLiteral("database"), QStringLiteral("database")));
-    postgres->appendRow(databases);
+    if (!postgres_.isConnected()) {
+        auto *root = schemaItem(QStringLiteral("PostgreSQL（未连接）"),
+                                QStringLiteral("connection"), QStringLiteral("postgresql"),
+                                QStringLiteral("PostgreSQL"));
+        schemaModel_->appendRow(root);
+        schemaTree_->setCurrentIndex(schemaProxy_->mapFromSource(root->index()));
+        return;
+    }
 
-    auto *schemas = schemaItem(QStringLiteral("Schemas"), QStringLiteral("group"), QStringLiteral("boxes"));
-    auto *publicSchema = schemaItem(QStringLiteral("public"), QStringLiteral("schema"), QStringLiteral("boxes"));
-    auto *tables = schemaItem(QStringLiteral("Tables"), QStringLiteral("group"), QStringLiteral("table-2"));
-    for (const QString &name : {QStringLiteral("users"), QStringLiteral("orders"), QStringLiteral("products"), QStringLiteral("events")})
-        tables->appendRow(schemaItem(name, QStringLiteral("Table"), QStringLiteral("table-2")));
-    tables->appendRow(schemaItem(QStringLiteral("…"), QStringLiteral("more"), QStringLiteral("")));
-    publicSchema->appendRow(tables);
-    publicSchema->appendRow(schemaItem(QStringLiteral("Views"), QStringLiteral("group"), QStringLiteral("eye")));
-    publicSchema->appendRow(schemaItem(QStringLiteral("Indexes"), QStringLiteral("group"), QStringLiteral("list-tree")));
-    publicSchema->appendRow(schemaItem(QStringLiteral("Functions"), QStringLiteral("group"), QStringLiteral("square-function")));
-    publicSchema->appendRow(schemaItem(QStringLiteral("Sequences"), QStringLiteral("group"), QStringLiteral("list-ordered")));
-    schemas->appendRow(publicSchema);
-    schemas->appendRow(schemaItem(QStringLiteral("analytics"), QStringLiteral("schema"), QStringLiteral("boxes")));
-    schemas->appendRow(schemaItem(QStringLiteral("staging"), QStringLiteral("schema"), QStringLiteral("boxes")));
-    schemas->appendRow(schemaItem(QStringLiteral("information_schema"), QStringLiteral("schema"), QStringLiteral("boxes")));
-    postgres->appendRow(schemas);
-    schemaModel_->appendRow(postgres);
+    QString version = postgres_.serverVersion().section(QLatin1Char(' '), 0, 0);
+    auto *root = schemaItem(QStringLiteral("PostgreSQL %1").arg(version),
+                            QStringLiteral("connection"), QStringLiteral("postgresql"),
+                            QStringLiteral("PostgreSQL"));
+    auto *users = schemaItem(QStringLiteral("Users"), QStringLiteral("users"),
+                             QStringLiteral("key-round"), {}, {}, true);
+    auto *databases = schemaItem(QStringLiteral("Databases"), QStringLiteral("databases"),
+                                 QStringLiteral("database"), {}, {}, true);
+    root->appendRow(users);
+    root->appendRow(databases);
+    schemaModel_->appendRow(root);
 
-    auto *mysql = schemaItem(QStringLiteral("MySQL 8.0"), QStringLiteral("connection"), QString{});
-    mysql->setIcon(toolbarIcon(QStringLiteral("mysql")));
-    schemaModel_->appendRow(mysql);
-    auto *redis = schemaItem(QStringLiteral("Redis 7.2"), QStringLiteral("connection"), QString{});
-    redis->setIcon(toolbarIcon(QStringLiteral("redis")));
-    auto *db0 = schemaItem(QStringLiteral("db0"), QStringLiteral("database"), QStringLiteral("database"));
-    auto *cache = schemaItem(QStringLiteral("cache"), QStringLiteral("group"), QStringLiteral("folder-open"));
-    for (const QString &key : {QStringLiteral("session:1a2b"), QStringLiteral("session:3f9c"), QStringLiteral("user:1001")})
-        cache->appendRow(schemaItem(key, QStringLiteral("Redis key"), QStringLiteral("key-round")));
-    db0->appendRow(cache);
-    redis->appendRow(db0);
-    redis->appendRow(schemaItem(QStringLiteral("db1"), QStringLiteral("database"), QStringLiteral("database")));
-    schemaModel_->appendRow(redis);
+    loadSchemaChildren(users);
+    loadSchemaChildren(databases);
+    schemaTree_->expand(schemaProxy_->mapFromSource(root->index()));
+    schemaTree_->expand(schemaProxy_->mapFromSource(users->index()));
+    schemaTree_->expand(schemaProxy_->mapFromSource(databases->index()));
 
-    schemaTree_->expandToDepth(4);
-    const QModelIndexList users = schemaModel_->match(
-        schemaModel_->index(0, 0), Qt::UserRole, QStringLiteral("users"), 1,
-        Qt::MatchExactly | Qt::MatchRecursive);
-    if (!users.isEmpty())
-        schemaTree_->setCurrentIndex(schemaProxy_->mapFromSource(users.constFirst()));
+    for (int row = 0; row < databases->rowCount(); ++row) {
+        QStandardItem *database = databases->child(row);
+        if (database->data(NameRole).toString() != postgres_.config().database)
+            continue;
+        schemaTree_->expand(schemaProxy_->mapFromSource(database->index()));
+        QStandardItem *schemas = database->child(0);
+        if (!schemas)
+            break;
+        loadSchemaChildren(schemas);
+        schemaTree_->expand(schemaProxy_->mapFromSource(schemas->index()));
+        for (int schemaRow = 0; schemaRow < schemas->rowCount(); ++schemaRow) {
+            QStandardItem *schema = schemas->child(schemaRow);
+            if (schema->data(NameRole).toString() == QStringLiteral("public")) {
+                loadSchemaChildren(schema);
+                schemaTree_->expand(schemaProxy_->mapFromSource(schema->index()));
+                for (int relationGroup = 0; relationGroup < schema->rowCount(); ++relationGroup)
+                    schemaTree_->expand(schemaProxy_->mapFromSource(schema->child(relationGroup)->index()));
+                break;
+            }
+        }
+        break;
+    }
+    schemaTree_->setCurrentIndex(schemaProxy_->mapFromSource(root->index()));
+}
+
+void MainWindow::loadSchemaChildren(QStandardItem *item)
+{
+    if (!item || item->data(LoadedRole).toBool() || !postgres_.isConnected())
+        return;
+
+    const QString type = item->data(TypeRole).toString();
+    QString error;
+    item->setData(true, LoadedRole);
+    item->removeRows(0, item->rowCount());
+
+    if (type == QStringLiteral("users")) {
+        const QStringList users = postgres_.users(&error);
+        for (const QString &user : users) {
+            const bool current = user == postgres_.currentUser();
+            QStandardItem *child = schemaItem(current ? QStringLiteral("%1（当前）").arg(user) : user,
+                                              QStringLiteral("user"), QStringLiteral("key-round"), user);
+            if (current) {
+                QFont font = child->font();
+                font.setBold(true);
+                child->setFont(font);
+            }
+            item->appendRow(child);
+        }
+    } else if (type == QStringLiteral("databases")) {
+        const QStringList databases = postgres_.databases(&error);
+        for (const QString &databaseName : databases) {
+            const bool current = databaseName == postgres_.config().database;
+            QStandardItem *database = schemaItem(
+                current ? QStringLiteral("%1（当前）").arg(databaseName) : databaseName,
+                QStringLiteral("database"), QStringLiteral("database"), databaseName);
+            if (current) {
+                QFont font = database->font();
+                font.setBold(true);
+                database->setFont(font);
+                database->appendRow(schemaItem(QStringLiteral("Schemas"), QStringLiteral("schemas"),
+                                               QStringLiteral("boxes"), {}, {}, true));
+            }
+            item->appendRow(database);
+        }
+    } else if (type == QStringLiteral("schemas")) {
+        const QStringList schemas = postgres_.schemas(&error);
+        for (const QString &schema : schemas)
+            item->appendRow(schemaItem(schema, QStringLiteral("schema"), QStringLiteral("boxes"),
+                                       schema, schema, true));
+    } else if (type == QStringLiteral("schema")) {
+        const QString schema = item->data(NameRole).toString();
+        const QVector<DatabaseRelation> relations = postgres_.relations(schema, &error);
+        auto *tables = schemaItem(QStringLiteral("Tables"), QStringLiteral("tables"),
+                                  QStringLiteral("table-2"));
+        auto *views = schemaItem(QStringLiteral("Views"), QStringLiteral("views"),
+                                 QStringLiteral("eye"));
+        for (const DatabaseRelation &relation : relations) {
+            QStandardItem *relationItem = schemaItem(
+                relation.name, relation.view ? QStringLiteral("View") : QStringLiteral("Table"),
+                relation.view ? QStringLiteral("eye") : QStringLiteral("table-2"),
+                relation.name, relation.schema);
+            (relation.view ? views : tables)->appendRow(relationItem);
+        }
+        item->appendRow(tables);
+        item->appendRow(views);
+    }
+
+    if (!error.isEmpty()) {
+        item->setData(false, LoadedRole);
+        item->appendRow(schemaItem(QStringLiteral("加载失败，展开重试"), QStringLiteral("loading")));
+        showDatabaseError(QStringLiteral("加载数据库结构失败"), error);
+    }
 }
 
 void MainWindow::installActions()
@@ -861,7 +746,7 @@ void MainWindow::installActions()
 
 void MainWindow::addQuery(const QString &sql)
 {
-    auto *page = new QueryPage(sql.isEmpty() ? QStringLiteral("SELECT *\nFROM public.users\nLIMIT 100;") : sql, queryTabs_);
+    auto *page = new QueryPage(sql.isEmpty() ? QStringLiteral("SELECT version();") : sql, queryTabs_);
     const QString title = QStringLiteral("Query %1").arg(queryNumber_++);
     page->setProperty("tabTitle", title);
     const int index = queryTabs_->addTab(page, toolbarIcon(QStringLiteral("file-code")), title);
@@ -871,52 +756,82 @@ void MainWindow::addQuery(const QString &sql)
     closeButton->setIconSize(QSize(12, 12));
     closeButton->setAutoRaise(true);
     closeButton->setFixedSize(18, 18);
-    closeButton->setToolTip(QStringLiteral("Close query (Ctrl+W)"));
+    closeButton->setToolTip(QStringLiteral("关闭查询（Ctrl+W）"));
     queryTabs_->tabBar()->setTabButton(index, QTabBar::RightSide, closeButton);
     connect(closeButton, &QToolButton::clicked, this, [this, page] {
         closeQuery(queryTabs_->indexOf(page));
     });
+    connect(page, &QueryPage::commitRequested, this, [this, page] { applyPendingChanges(page); });
     queryTabs_->setCurrentIndex(index);
-    page->editor->document()->setModified(false);
-    connect(page->editor->document(), &QTextDocument::modificationChanged, this, [this, page](bool modified) {
+    page->editor()->document()->setModified(false);
+    connect(page->editor()->document(), &QTextDocument::modificationChanged,
+            this, [this, page](bool modified) {
         const int tabIndex = queryTabs_->indexOf(page);
         if (tabIndex < 0)
             return;
         const QString baseTitle = page->property("tabTitle").toString();
         queryTabs_->setTabText(tabIndex, modified ? QStringLiteral("* %1").arg(baseTitle) : baseTitle);
     });
-    page->editor->setFocus();
+    page->editor()->setFocus();
 }
 
 QueryPage *MainWindow::currentQuery() const
 {
-    return static_cast<QueryPage *>(queryTabs_->currentWidget());
+    return qobject_cast<QueryPage *>(queryTabs_->currentWidget());
 }
 
 void MainWindow::executeQuery()
 {
     QueryPage *page = currentQuery();
-    if (!page || executionTimer_->isActive())
+    if (!page)
         return;
-    page->elapsed.start();
-    page->summary->setText(QStringLiteral("Running query…"));
-    executionTimer_->start(90);
+    page->clearTableContext();
+    runQuery(page, false);
+}
+
+void MainWindow::runQuery(QueryPage *page, bool editableTable)
+{
+    if (!page)
+        return;
+    if (!postgres_.isConnected()) {
+        page->setStatus(QStringLiteral("请先连接 PostgreSQL"));
+        showPostgresConnectionDialog();
+        return;
+    }
+    const QString sql = page->selectedSql().trimmed();
+    if (sql.isEmpty()) {
+        page->setStatus(QStringLiteral("请输入要执行的 SQL"));
+        return;
+    }
+
+    page->beginExecution();
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    QString error;
+    QueryResult result = postgres_.execute(sql, page->rowLimit(), &error);
+    QApplication::restoreOverrideCursor();
+    if (!error.isEmpty()) {
+        page->setStatus(QStringLiteral("执行失败：%1").arg(error));
+        showDatabaseError(QStringLiteral("SQL 执行失败"), error);
+        return;
+    }
+    page->setQueryResult(std::move(result), editableTable);
 }
 
 void MainWindow::stopQuery()
 {
-    if (!executionTimer_ || !executionTimer_->isActive())
-        return;
-    executionTimer_->stop();
     if (QueryPage *page = currentQuery())
-        page->summary->setText(QStringLiteral("Query cancelled"));
+        page->setStatus(QStringLiteral("当前没有异步执行中的查询"));
 }
 
 void MainWindow::refreshSchema()
 {
-    QTimer::singleShot(120, this, [this] {
-        schemaTree_->expandToDepth(4);
-    });
+    if (!postgres_.isConnected()) {
+        showPostgresConnectionDialog();
+        return;
+    }
+    populateSchema();
+    statusBar()->showMessage(QStringLiteral("数据库结构已刷新"), 3000);
 }
 
 void MainWindow::closeQuery(int index)
@@ -936,111 +851,249 @@ void MainWindow::handleSchemaSelection()
     if (!proxyIndex.isValid())
         return;
     const QModelIndex source = schemaProxy_->mapToSource(proxyIndex);
-    updateInspector(source.data(Qt::UserRole).toString(), source.data(TypeRole).toString());
+    const QString name = source.data(NameRole).toString();
+    const QString type = source.data(TypeRole).toString();
+    const QString schema = source.data(SchemaRole).toString();
+    if ((type == QStringLiteral("Table") || type == QStringLiteral("View"))
+        && postgres_.isConnected()) {
+        QString error;
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const DatabaseTable table = postgres_.describeTable(schema, name, &error);
+        QApplication::restoreOverrideCursor();
+        if (!error.isEmpty()) {
+            showDatabaseError(QStringLiteral("读取关系结构失败"), error);
+            return;
+        }
+        updateInspector(table);
+        return;
+    }
+    updateInspector(name, type, schema);
 }
 
 void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
 {
     const QModelIndex source = schemaProxy_->mapToSource(proxyIndex);
-    if (source.data(TypeRole).toString() != QStringLiteral("Table"))
+    const QString type = source.data(TypeRole).toString();
+    const QString name = source.data(NameRole).toString();
+    const QString schema = source.data(SchemaRole).toString();
+    QString error;
+
+    if (type == QStringLiteral("user")) {
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const bool switched = postgres_.switchUser(name, &error);
+        QApplication::restoreOverrideCursor();
+        if (!switched) {
+            showDatabaseError(QStringLiteral("切换用户失败"), error);
+            return;
+        }
+        updateConnectionUi();
+        populateSchema();
+        statusBar()->showMessage(QStringLiteral("当前用户已切换为 %1").arg(name), 5000);
         return;
-    const QString name = source.data(Qt::UserRole).toString();
-    addQuery(QStringLiteral("SELECT *\nFROM public.%1\nLIMIT 100;").arg(name));
+    }
+
+    if (type == QStringLiteral("database")) {
+        if (name == postgres_.config().database) {
+            schemaTree_->expand(proxyIndex);
+            return;
+        }
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const bool switched = postgres_.switchDatabase(name, &error);
+        QApplication::restoreOverrideCursor();
+        if (!switched) {
+            showDatabaseError(QStringLiteral("切换数据库失败"), error);
+            return;
+        }
+        updateConnectionUi();
+        populateSchema();
+        statusBar()->showMessage(QStringLiteral("当前数据库已切换为 %1").arg(name), 5000);
+        return;
+    }
+
+    if (type != QStringLiteral("Table") && type != QStringLiteral("View"))
+        return;
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const DatabaseTable table = postgres_.describeTable(schema, name, &error);
+    QApplication::restoreOverrideCursor();
+    if (!error.isEmpty()) {
+        showDatabaseError(QStringLiteral("读取关系结构失败"), error);
+        return;
+    }
+
+    const QString sql = QStringLiteral("SELECT *\nFROM %1\nLIMIT 100;")
+                            .arg(postgres_.qualifiedName(schema, name));
+    addQuery(sql);
+    QueryPage *page = currentQuery();
+    const bool editable = type == QStringLiteral("Table") && !table.primaryKeys().isEmpty();
+    if (editable)
+        page->setTableContext(schema, name, table.primaryKeys());
+    else
+        page->clearTableContext();
+    runQuery(page, editable);
 }
 
-void MainWindow::updateInspector(const QString &name, const QString &type)
+void MainWindow::applyPendingChanges(QueryPage *page)
 {
-    const bool isTable = type == QStringLiteral("Table");
-    QString iconName = QStringLiteral("boxes");
-    if (isTable)
-        iconName = QStringLiteral("table-2");
-    else if (type == QStringLiteral("database"))
-        iconName = QStringLiteral("database");
-    else if (type == QStringLiteral("schema"))
-        iconName = QStringLiteral("boxes");
-    else if (type == QStringLiteral("Redis key"))
-        iconName = QStringLiteral("key-round");
-    else if (type == QStringLiteral("connection")) {
-        if (name.startsWith(QStringLiteral("PostgreSQL")))
-            iconName = QStringLiteral("postgresql");
-        else if (name.startsWith(QStringLiteral("MySQL")))
-            iconName = QStringLiteral("mysql");
-        else if (name.startsWith(QStringLiteral("Redis")))
-            iconName = QStringLiteral("redis");
-    } else if (type == QStringLiteral("group")) {
-        if (name == QStringLiteral("Databases"))
-            iconName = QStringLiteral("database");
-        else if (name == QStringLiteral("Tables"))
-            iconName = QStringLiteral("table-2");
-        else if (name == QStringLiteral("Views"))
-            iconName = QStringLiteral("eye");
-        else if (name == QStringLiteral("Indexes"))
-            iconName = QStringLiteral("list-tree");
-        else if (name == QStringLiteral("Functions"))
-            iconName = QStringLiteral("square-function");
-        else if (name == QStringLiteral("Sequences"))
-            iconName = QStringLiteral("list-ordered");
-        else if (name == QStringLiteral("cache"))
-            iconName = QStringLiteral("folder-open");
+    if (!page || page->resultModel()->pendingChangeCount() == 0)
+        return;
+    QString error;
+    ResultTableModel *model = page->resultModel();
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool applied = postgres_.applyChanges(
+        page->tableSchema(), page->tableName(), model->columns(), model->originalRows(),
+        page->primaryKeys(), model->pendingChanges(), &error);
+    QApplication::restoreOverrideCursor();
+    if (!applied) {
+        showDatabaseError(QStringLiteral("提交修改失败"), error);
+        page->setStatus(QStringLiteral("提交失败：%1").arg(error));
+        return;
     }
-    objectIcon_->setPixmap(toolbarIcon(iconName).pixmap(QSize(20, 20)));
-    objectName_->setText(name.isEmpty() ? QStringLiteral("users") : name);
-    objectType_->setText(type.isEmpty() ? QStringLiteral("Table") : type);
-    objectPath_->setText(isTable ? QStringLiteral("public.%1").arg(name) : QStringLiteral("analytics / public"));
-    rowEstimate_->setText(isTable ? QStringLiteral("~ 10,248") : QStringLiteral("—"));
+    const int count = model->pendingChangeCount();
+    model->commitPendingChanges();
+    page->setStatus(QStringLiteral("已在一个事务中提交 %1 处修改").arg(count));
+}
 
+void MainWindow::updateInspector(const QString &name, const QString &type,
+                                 const QString &schema)
+{
+    QString iconName = QStringLiteral("boxes");
+    QString displayType = type;
+    QString path;
+    if (type == QStringLiteral("connection")) {
+        iconName = QStringLiteral("postgresql");
+        displayType = postgres_.isConnected() ? QStringLiteral("PostgreSQL connection")
+                                              : QStringLiteral("Disconnected");
+        path = postgres_.isConnected()
+            ? QStringLiteral("%1:%2/%3").arg(postgres_.config().host)
+                  .arg(postgres_.config().port).arg(postgres_.config().database)
+            : QStringLiteral("双击工具栏连接按钮以开始");
+        description_->setText(postgres_.isConnected()
+            ? QStringLiteral("当前用户：%1").arg(postgres_.currentUser()) : QStringLiteral("—"));
+    } else if (type == QStringLiteral("database")) {
+        iconName = QStringLiteral("database");
+        displayType = QStringLiteral("Database");
+        path = postgres_.config().host + QStringLiteral(" / ") + name;
+    } else if (type == QStringLiteral("schema")) {
+        iconName = QStringLiteral("boxes");
+        displayType = QStringLiteral("Schema");
+        path = postgres_.config().database + QStringLiteral(" / ") + name;
+    } else if (type == QStringLiteral("user")) {
+        iconName = QStringLiteral("key-round");
+        displayType = QStringLiteral("PostgreSQL user");
+        path = postgres_.config().host + QStringLiteral(" / users / ") + name;
+    } else if (type == QStringLiteral("users")) {
+        iconName = QStringLiteral("key-round");
+        displayType = QStringLiteral("Users");
+        path = postgres_.config().host + QStringLiteral(" / users");
+    } else if (type == QStringLiteral("databases")) {
+        iconName = QStringLiteral("database");
+        displayType = QStringLiteral("Databases");
+        path = postgres_.config().host + QStringLiteral(" / databases");
+    } else if (type == QStringLiteral("tables")) {
+        iconName = QStringLiteral("table-2");
+        displayType = QStringLiteral("Tables");
+        path = postgres_.config().database + QStringLiteral(" / ") + schema;
+    } else if (type == QStringLiteral("views")) {
+        iconName = QStringLiteral("eye");
+        displayType = QStringLiteral("Views");
+        path = postgres_.config().database + QStringLiteral(" / ") + schema;
+    }
+
+    objectIcon_->setPixmap(toolbarIcon(iconName).pixmap(QSize(20, 20)));
+    objectName_->setText(name);
+    objectType_->setText(displayType);
+    objectPath_->setText(path);
+    rowEstimate_->setText(QStringLiteral("—"));
+    size_->setText(QStringLiteral("—"));
+    if (type != QStringLiteral("connection"))
+        description_->setText(QStringLiteral("—"));
+    clearInspectorModels();
+}
+
+void MainWindow::updateInspector(const DatabaseTable &table)
+{
+    objectIcon_->setPixmap(toolbarIcon(QStringLiteral("table-2")).pixmap(QSize(20, 20)));
+    objectName_->setText(table.name);
+    objectType_->setText(QStringLiteral("PostgreSQL relation"));
+    objectPath_->setText(QStringLiteral("%1 / %2.%3")
+                             .arg(postgres_.config().database, table.schema, table.name));
+    rowEstimate_->setText(table.estimatedRows >= 0
+        ? QStringLiteral("约 %1").arg(table.estimatedRows) : QStringLiteral("—"));
+    size_->setText(table.totalSize.isEmpty() ? QStringLiteral("—") : table.totalSize);
+    description_->setText(table.description.isEmpty() ? QStringLiteral("—") : table.description);
+    clearInspectorModels();
+
+    for (const DatabaseColumn &column : table.columns) {
+        appendReadOnlyRow(columnModel_,
+                          {column.name, column.type, column.nullable ? QStringLiteral("YES")
+                                                                   : QStringLiteral("NO"),
+                           column.defaultValue.isEmpty() ? QStringLiteral("—") : column.defaultValue},
+                          column.primaryKey ? QStringLiteral("key-round") : QString{});
+    }
+    for (const DatabaseIndex &index : table.indexes)
+        appendReadOnlyRow(indexModel_, {index.name, index.definition}, QStringLiteral("key-round"));
+    for (const DatabaseForeignKey &foreignKey : table.foreignKeys)
+        appendReadOnlyRow(foreignKeyModel_, {foreignKey.name, foreignKey.definition},
+                          QStringLiteral("key-round"));
+}
+
+void MainWindow::clearInspectorModels()
+{
     columnModel_->removeRows(0, columnModel_->rowCount());
     indexModel_->removeRows(0, indexModel_->rowCount());
     foreignKeyModel_->removeRows(0, foreignKeyModel_->rowCount());
-    const QList<QStringList> columns{
-        {QStringLiteral("id"), QStringLiteral("bigint"), QStringLiteral("NO"), QStringLiteral("nextval(…)")},
-        {QStringLiteral("email"), QStringLiteral("text"), QStringLiteral("NO"), QStringLiteral("—")},
-        {QStringLiteral("password_hash"), QStringLiteral("text"), QStringLiteral("NO"), QStringLiteral("—")},
-        {QStringLiteral("organization_id"), QStringLiteral("uuid"), QStringLiteral("NO"), QStringLiteral("—")},
-        {QStringLiteral("created_at"), QStringLiteral("timestamptz"), QStringLiteral("NO"), QStringLiteral("now()")},
-        {QStringLiteral("updated_at"), QStringLiteral("timestamptz"), QStringLiteral("YES"), QStringLiteral("now()")},
-        {QStringLiteral("is_active"), QStringLiteral("boolean"), QStringLiteral("NO"), QStringLiteral("true")}};
-    if (isTable) {
-        for (const QStringList &row : columns) {
-            QList<QStandardItem *> items;
-            for (const QString &cell : row) {
-                auto *item = new QStandardItem(cell);
-                item->setEditable(false);
-                items.append(item);
-            }
-            if (row.constFirst() == QStringLiteral("id"))
-                items.constFirst()->setIcon(toolbarIcon(QStringLiteral("key-round")));
-            columnModel_->appendRow(items);
-        }
+}
 
-        const QList<QStringList> indexes{
-            {QStringLiteral("users_pkey"), QStringLiteral("id"), QStringLiteral("Primary key")},
-            {QStringLiteral("users_email_key"), QStringLiteral("email"), QStringLiteral("Unique")}};
-        for (const QStringList &row : indexes) {
-            QList<QStandardItem *> items;
-            for (const QString &cell : row) {
-                auto *item = new QStandardItem(cell);
-                item->setEditable(false);
-                items.append(item);
-            }
-            items.constFirst()->setIcon(toolbarIcon(QStringLiteral("key-round")));
-            indexModel_->appendRow(items);
-        }
-
-        const QList<QStringList> foreignKeys{
-            {QStringLiteral("users_org_id_fkey"), QStringLiteral("organization_id"), QStringLiteral("organizations(id)")}};
-        for (const QStringList &row : foreignKeys) {
-            QList<QStandardItem *> items;
-            for (const QString &cell : row) {
-                auto *item = new QStandardItem(cell);
-                item->setEditable(false);
-                items.append(item);
-            }
-            items.constFirst()->setIcon(toolbarIcon(QStringLiteral("key-round")));
-            foreignKeyModel_->appendRow(items);
-        }
+void MainWindow::updateConnectionUi()
+{
+    connectionContext_->clear();
+    schemaContext_->clear();
+    const bool connected = postgres_.isConnected();
+    reconnectAction_->setEnabled(connected);
+    disconnectAction_->setEnabled(connected);
+    if (!connected) {
+        connectionContext_->addItem(toolbarIcon(QStringLiteral("postgresql")),
+                                    QStringLiteral("PostgreSQL · 未连接"));
+        schemaContext_->addItem(toolbarIcon(QStringLiteral("boxes")), QStringLiteral("无活动数据库"));
+        return;
     }
 
+    const QString label = QStringLiteral("%1@%2 / %3")
+                              .arg(postgres_.currentUser(), postgres_.config().host,
+                                   postgres_.config().database);
+    connectionContext_->addItem(toolbarIcon(QStringLiteral("postgresql")), label);
+    schemaContext_->addItem(toolbarIcon(QStringLiteral("boxes")),
+                            QStringLiteral("public @ %1").arg(postgres_.config().database));
+}
+
+void MainWindow::showPostgresConnectionDialog()
+{
+    PostgresConnectionDialog dialog(this);
+    if (!postgres_.config().user.isEmpty())
+        dialog.setConfig(postgres_.config());
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QString error;
+    const bool connected = postgres_.connectToServer(dialog.config(), &error);
+    QApplication::restoreOverrideCursor();
+    if (!connected) {
+        showDatabaseError(QStringLiteral("PostgreSQL 连接失败"), error);
+        updateConnectionUi();
+        populateSchema();
+        return;
+    }
+    updateConnectionUi();
+    populateSchema();
+    updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+    statusBar()->showMessage(QStringLiteral("已连接 %1").arg(postgres_.config().displayName()), 5000);
+}
+
+void MainWindow::showDatabaseError(const QString &title, const QString &error)
+{
+    QMessageBox::critical(this, title, error.isEmpty() ? QStringLiteral("未知数据库错误") : error);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

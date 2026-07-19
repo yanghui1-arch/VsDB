@@ -1,5 +1,7 @@
 #pragma once
 
+#include "database/DatabaseTypes.h"
+
 #include <QAbstractTableModel>
 #include <QHash>
 #include <QHeaderView>
@@ -20,20 +22,25 @@ public:
     QVariant headerData(int section, Qt::Orientation orientation,
                         int role = Qt::DisplayRole) const override;
 
-    void setVisibleRows(int rows);
+    void setResult(QueryResult result, bool editable = false);
+    const QVector<QueryColumn> &columns() const;
+    const QVector<QVariantList> &originalRows() const;
+    QVector<CellChange> pendingChanges() const;
     int pendingChangeCount() const;
+    bool isEditable() const;
     void commitPendingChanges();
     void rollbackPendingChanges();
 
 private:
     static quint64 cellKey(int row, int column);
-    QVariant generatedValue(const QModelIndex &index) const;
+    static int keyRow(quint64 key);
+    static int keyColumn(quint64 key);
     QVariant normalizedValue(const QModelIndex &index, const QVariant &value) const;
     void notifyChangedCells(const QList<quint64> &keys);
 
-    int visibleRows_ = 100;
-    QHash<quint64, QVariant> committedValues_;
+    QueryResult result_;
     QHash<quint64, QVariant> pendingValues_;
+    bool editable_ = false;
 };
 
 class TwoLineHeaderView final : public QHeaderView
