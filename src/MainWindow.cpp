@@ -317,15 +317,11 @@ bool MainWindow::openRelationPreview(const QString &schema, const QString &relat
     const DatabaseTable table = postgres_.describeTable(schema, relation, error);
     if (error && !error->isEmpty())
         return false;
-    const RelationPreviewQuery preview = postgres_.buildRelationPreview(table);
-    addQuery(preview.sql);
+    addQuery(postgres_.buildRelationPreview(table));
     QueryPage *page = currentQuery();
     const bool editable = !table.primaryKeys().isEmpty();
     if (editable)
         page->setTableContext(schema, relation, table.primaryKeys());
-    if (!preview.omittedColumns.isEmpty())
-        page->setResultNotice(QStringLiteral("已省略 %1 个大字段")
-                                  .arg(preview.omittedColumns.size()));
     updateInspector(table);
     runQuery(page, editable);
     return true;
@@ -1024,17 +1020,13 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
         return;
     }
 
-    const RelationPreviewQuery preview = postgres_.buildRelationPreview(table);
-    addQuery(preview.sql);
+    addQuery(postgres_.buildRelationPreview(table));
     QueryPage *page = currentQuery();
     const bool editable = type == QStringLiteral("Table") && !table.primaryKeys().isEmpty();
     if (editable)
         page->setTableContext(schema, name, table.primaryKeys());
     else
         page->clearTableContext();
-    if (!preview.omittedColumns.isEmpty())
-        page->setResultNotice(QStringLiteral("已省略 %1 个大字段")
-                                  .arg(preview.omittedColumns.size()));
     runQuery(page, editable);
 }
 

@@ -89,12 +89,6 @@ struct QueryResult
     bool truncated = false;
 };
 
-struct RelationPreviewQuery
-{
-    QString sql;
-    QStringList omittedColumns;
-};
-
 struct CellChange
 {
     int row = -1;

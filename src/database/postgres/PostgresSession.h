@@ -33,8 +33,8 @@ public:
     QVector<DatabaseRelation> relations(const QString &schema, QString *error) const;
     DatabaseTable describeTable(const QString &schema, const QString &table,
                                 QString *error) const;
-    RelationPreviewQuery buildRelationPreview(const DatabaseTable &table,
-                                               int rowLimit = 100) const;
+    QString buildRelationPreview(const DatabaseTable &table,
+                                 int rowLimit = 100) const;
 
     QueryResult execute(const QString &sql, int rowLimit, QString *error) const;
     bool cancelBackend(qint64 backendPid, QString *error) const;

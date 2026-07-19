@@ -56,31 +56,6 @@ QString queryError(const QSqlQuery &query)
     return databaseText.isEmpty() ? error.text().trimmed() : databaseText;
 }
 
-bool isPotentiallyLargeType(const QString &sqlType)
-{
-    const QString type = sqlType.trimmed().toLower();
-    if (type == QStringLiteral("text") || type == QStringLiteral("json")
-        || type == QStringLiteral("jsonb") || type == QStringLiteral("xml")
-        || type == QStringLiteral("bytea") || type == QStringLiteral("tsvector")
-        || type.endsWith(QStringLiteral("[]")))
-        return true;
-
-    const bool variableLength = type.startsWith(QStringLiteral("character varying"))
-        || type.startsWith(QStringLiteral("bit varying"));
-    const bool fixedLength = type.startsWith(QStringLiteral("character("))
-        || type.startsWith(QStringLiteral("bit("));
-    if (!variableLength && !fixedLength)
-        return false;
-
-    const qsizetype opening = type.indexOf(QLatin1Char('('));
-    const qsizetype closing = type.indexOf(QLatin1Char(')'), opening + 1);
-    if (opening < 0 || closing <= opening + 1)
-        return variableLength;
-    bool valid = false;
-    const int declaredLength = type.mid(opening + 1, closing - opening - 1).toInt(&valid);
-    return !valid || declaredLength > 1024;
-}
-
 } // namespace
 
 PostgresSession::PostgresSession()
@@ -463,32 +438,20 @@ DatabaseTable PostgresSession::describeTable(const QString &schema,
     return result;
 }
 
-RelationPreviewQuery PostgresSession::buildRelationPreview(const DatabaseTable &table,
-                                                           int rowLimit) const
+QString PostgresSession::buildRelationPreview(const DatabaseTable &table,
+                                              int rowLimit) const
 {
-    RelationPreviewQuery preview;
     QStringList selectedColumns;
-    for (const DatabaseColumn &column : table.columns) {
-        if (!column.primaryKey && isPotentiallyLargeType(column.type)) {
-            preview.omittedColumns.append(column.name);
-            continue;
-        }
+    selectedColumns.reserve(table.columns.size());
+    for (const DatabaseColumn &column : table.columns)
         selectedColumns.append(quoteIdentifier(column.name));
-    }
-
-    if (selectedColumns.isEmpty() && !table.columns.isEmpty()) {
-        const QString fallback = table.columns.constFirst().name;
-        selectedColumns.append(quoteIdentifier(fallback));
-        preview.omittedColumns.removeAll(fallback);
-    }
     if (selectedColumns.isEmpty())
         selectedColumns.append(QStringLiteral("*"));
 
-    preview.sql = QStringLiteral("SELECT\n    %1\nFROM %2\nLIMIT %3;")
-                      .arg(selectedColumns.join(QStringLiteral(",\n    ")),
-                           qualifiedName(table.schema, table.name))
-                      .arg(qBound(1, rowLimit, 10000));
-    return preview;
+    return QStringLiteral("SELECT\n    %1\nFROM %2\nLIMIT %3;")
+        .arg(selectedColumns.join(QStringLiteral(",\n    ")),
+             qualifiedName(table.schema, table.name))
+        .arg(qBound(1, rowLimit, 10000));
 }
 
 QueryResult PostgresSession::execute(const QString &sql, int rowLimit,

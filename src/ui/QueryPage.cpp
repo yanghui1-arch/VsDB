@@ -318,8 +318,6 @@ void QueryPage::finishExecution(qlonglong affectedRows, bool truncated,
             message += QStringLiteral(" · 已达到 64 MB 内存保护上限");
         else if (truncated)
             message += QStringLiteral(" · 已达到显示上限");
-        if (!resultNotice_.isEmpty())
-            message += QStringLiteral(" · %1").arg(resultNotice_);
     } else {
         message = QStringLiteral("命令执行成功 · 影响 %1 行 · %2 毫秒")
                       .arg(affectedRows).arg(elapsedMilliseconds());
@@ -346,11 +344,6 @@ void QueryPage::setStatus(const QString &message)
     messages_->setPlainText(message);
 }
 
-void QueryPage::setResultNotice(const QString &notice)
-{
-    resultNotice_ = notice;
-}
-
 void QueryPage::setTableContext(const QString &schema, const QString &table,
                                 const QStringList &primaryKeys)
 {
@@ -364,7 +357,6 @@ void QueryPage::clearTableContext()
     tableSchema_.clear();
     tableName_.clear();
     primaryKeys_.clear();
-    resultNotice_.clear();
 }
 
 QString QueryPage::tableSchema() const

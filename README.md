@@ -9,7 +9,7 @@ VsDB 是基于 Qt 6 的轻量数据库工作台，目前提供真实的 PostgreS
 - 查看表的字段、PostgreSQL 类型、可空性、默认值、主键、索引、外键、大小和说明。
 - 直接执行查询以及 `INSERT`、`UPDATE`、`DELETE`、DDL 等 SQL，结果按 50/100/500 行限制读取。
 - 双击有主键的表后可编辑结果单元格，并在一个事务中提交或回滚修改。
-- 双击表时优先查询主键和轻量字段，默认省略 `text`、`json`、`bytea` 等潜在大字段；需要时可在 SQL 中显式加入。
+- 双击表时查询并展示全部字段，字段顺序与 PostgreSQL 表结构保持一致。
 - 查询在专用数据库线程中执行，使用只进游标按 32 行分批更新结果；单次结果设有 64 MB 内存保护。
 - 大文本在表格中只绘制 512 字符摘要，复制、导出和编辑仍使用完整值；结构树按展开动作加载。
 
@@ -20,7 +20,7 @@ src/
 ├─ database/
 │  ├─ DatabaseTypes.h                 # 数据库领域数据结构
 │  └─ postgres/
-│     ├─ PostgresSession.*            # 连接、元数据、轻量预览、写入与取消
+│     ├─ PostgresSession.*            # 连接、元数据、表预览、写入与取消
 │     └─ PostgresQueryWorker.*        # 后台查询、分批读取与内存保护
 ├─ ui/
 │  ├─ PostgresConnectionDialog.*      # PostgreSQL 连接参数与校验

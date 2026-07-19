@@ -34,14 +34,15 @@ int main(int argc, char *argv[])
         {QStringLiteral("payload"), QStringLiteral("text"), true, {}, false},
         {QStringLiteral("document"), QStringLiteral("jsonb"), true, {}, false}
     };
-    const vsdb::RelationPreviewQuery preview = session.buildRelationPreview(previewTable, 50);
-    if (!preview.sql.contains(QStringLiteral("\"id\""))
-        || !preview.sql.contains(QStringLiteral("\"summary\""))
-        || preview.sql.contains(QStringLiteral("\"payload\""))
-        || preview.omittedColumns != QStringList{QStringLiteral("payload"),
-                                                  QStringLiteral("document")}
-        || !preview.sql.endsWith(QStringLiteral("LIMIT 50;")))
-        return fail(21, QStringLiteral("large-column preview query was not bounded"));
+    const QString preview = session.buildRelationPreview(previewTable, 50);
+    const qsizetype idPosition = preview.indexOf(QStringLiteral("\"id\""));
+    const qsizetype summaryPosition = preview.indexOf(QStringLiteral("\"summary\""));
+    const qsizetype payloadPosition = preview.indexOf(QStringLiteral("\"payload\""));
+    const qsizetype documentPosition = preview.indexOf(QStringLiteral("\"document\""));
+    if (idPosition < 0 || summaryPosition <= idPosition || payloadPosition <= summaryPosition
+        || documentPosition <= payloadPosition
+        || !preview.endsWith(QStringLiteral("LIMIT 50;")))
+        return fail(21, QStringLiteral("table preview did not preserve all columns"));
 
     const QString host = qEnvironmentVariable("VSDB_TEST_PG_HOST");
     if (host.isEmpty()) {

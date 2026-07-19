@@ -39,7 +39,6 @@ public:
                          qint64 loadedBytes, const QString &error = {});
     void setQueryResult(QueryResult result, bool editable);
     void setStatus(const QString &message);
-    void setResultNotice(const QString &notice);
 
     void setTableContext(const QString &schema, const QString &table,
                          const QStringList &primaryKeys);
@@ -68,7 +67,6 @@ private:
     QElapsedTimer elapsed_;
     bool executing_ = false;
     bool selectResult_ = false;
-    QString resultNotice_;
     QString tableSchema_;
     QString tableName_;
     QStringList primaryKeys_;

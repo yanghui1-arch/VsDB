@@ -218,7 +218,7 @@ QVariant ResultTableModel::displayValue(const QVariant &value)
         const QString text = value.toString();
         if (text.size() > previewLength) {
             return text.left(previewLength)
-                + QStringLiteral("…（已省略 %1 个字符）").arg(text.size() - previewLength);
+                + QStringLiteral("…（完整值共 %1 个字符）").arg(text.size());
         }
     } else if (value.metaType().id() == QMetaType::QByteArray) {
         return QStringLiteral("二进制数据（%1 字节）").arg(value.toByteArray().size());
