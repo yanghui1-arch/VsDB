@@ -1,6 +1,7 @@
 #include "WorkbenchModels.h"
 
 #include <QApplication>
+#include <QUuid>
 #include <iostream>
 
 namespace {
@@ -38,6 +39,12 @@ int main(int argc, char *argv[])
     const QModelIndex email = model.index(0, 1);
     if (!(model.flags(email) & Qt::ItemIsEditable))
         return fail(5, "editable table results should allow edits");
+    if (!model.setData(email, email.data(Qt::EditRole))
+        || model.pendingChangeCount() != 0)
+        return fail(16, "committing an unchanged editor value must not stage a change");
+    if (!model.setData(model.index(1, 1), QString{})
+        || model.pendingChangeCount() != 0)
+        return fail(17, "opening and closing a null value must not stage a change");
     if (!model.setData(email, QStringLiteral("updated@example.com"))
         || model.pendingChangeCount() != 1
         || email.data().toString() != QStringLiteral("updated@example.com"))
@@ -82,5 +89,20 @@ int main(int argc, char *argv[])
     if (payload.data(Qt::DisplayRole).toString().size() >= largeText.size()
         || payload.data(Qt::EditRole).toString() != largeText)
         return fail(15, "large values must be previewed without discarding their full value");
+
+    const QUuid uuid(QStringLiteral("4aecbc0b-0346-4dd6-8000-000000000001"));
+    vsdb::QueryResult exactValueResult;
+    exactValueResult.select = true;
+    exactValueResult.columns = {{QStringLiteral("content"), QStringLiteral("text")},
+                                {QStringLiteral("identifier"), QStringLiteral("uuid")}};
+    exactValueResult.rows = {{QStringLiteral("保留首尾空白 \n"), QVariant::fromValue(uuid)}};
+    model.setResult(exactValueResult, true);
+    if (!model.setData(model.index(0, 0), QStringLiteral("保留首尾空白 \n"))
+        || !model.setData(model.index(0, 1), uuid.toString(QUuid::WithoutBraces))
+        || model.pendingChangeCount() != 0)
+        return fail(18, "equivalent text and uuid editor values must not stage changes");
+    if (!model.setData(model.index(0, 0), QStringLiteral("保留首尾空白"))
+        || model.pendingChangeCount() != 1)
+        return fail(19, "a real whitespace change must still be staged");
     return 0;
 }

@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QPainter>
 #include <QTime>
+#include <QUuid>
 
 #include <utility>
 
@@ -72,16 +73,24 @@ bool ResultTableModel::setData(const QModelIndex &index, const QVariant &value, 
         || index.row() >= result_.rows.size() || index.column() >= result_.columns.size())
         return false;
 
+    const quint64 key = cellKey(index.row(), index.column());
+    const QVariant original = result_.rows.at(index.row()).at(index.column());
     const QVariant normalized = normalizedValue(index, value);
     if (!normalized.isValid())
         return false;
 
-    const quint64 key = cellKey(index.row(), index.column());
-    const QVariant original = result_.rows.at(index.row()).at(index.column());
-    if (normalized == original)
+    const bool hadPendingValue = pendingValues_.contains(key);
+    const bool unchanged = (normalized.isNull() && original.isNull())
+        || normalized == original;
+    if (unchanged) {
+        if (!hadPendingValue)
+            return true;
         pendingValues_.remove(key);
-    else
+    } else {
+        if (hadPendingValue && pendingValues_.value(key) == normalized)
+            return true;
         pendingValues_.insert(key, normalized);
+    }
 
     emit dataChanged(index, index,
                      {Qt::DisplayRole, Qt::EditRole, Qt::BackgroundRole,
@@ -230,52 +239,78 @@ QVariant ResultTableModel::normalizedValue(const QModelIndex &index,
                                            const QVariant &value) const
 {
     const QVariant original = result_.rows.at(index.row()).at(index.column());
-    const QString text = value.toString().trimmed();
-    if (text.compare(QStringLiteral("NULL"), Qt::CaseInsensitive) == 0)
+    const QString rawText = value.toString();
+    const QString trimmedText = rawText.trimmed();
+    if (original.isNull() && (value.isNull() || rawText.isEmpty()))
+        return original;
+    if (trimmedText.compare(QStringLiteral("NULL"), Qt::CaseInsensitive) == 0)
         return QVariant(original.metaType());
 
     bool ok = false;
     switch (original.metaType().id()) {
+    case QMetaType::QString:
+        return rawText;
     case QMetaType::Int: {
-        const int number = text.toInt(&ok);
+        const int number = trimmedText.toInt(&ok);
         return ok ? QVariant(number) : QVariant{};
     }
     case QMetaType::UInt: {
-        const uint number = text.toUInt(&ok);
+        const uint number = trimmedText.toUInt(&ok);
         return ok ? QVariant(number) : QVariant{};
     }
     case QMetaType::LongLong: {
-        const qlonglong number = text.toLongLong(&ok);
+        const qlonglong number = trimmedText.toLongLong(&ok);
         return ok ? QVariant(number) : QVariant{};
     }
     case QMetaType::ULongLong: {
-        const qulonglong number = text.toULongLong(&ok);
+        const qulonglong number = trimmedText.toULongLong(&ok);
         return ok ? QVariant(number) : QVariant{};
     }
     case QMetaType::Double: {
-        const double number = text.toDouble(&ok);
+        const double number = trimmedText.toDouble(&ok);
+        return ok ? QVariant(number) : QVariant{};
+    }
+    case QMetaType::Float: {
+        const float number = trimmedText.toFloat(&ok);
         return ok ? QVariant(number) : QVariant{};
     }
     case QMetaType::Bool:
-        if (text.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0 || text == QStringLiteral("1"))
+        if (trimmedText.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0
+            || trimmedText == QStringLiteral("1"))
             return true;
-        if (text.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0 || text == QStringLiteral("0"))
+        if (trimmedText.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0
+            || trimmedText == QStringLiteral("0"))
             return false;
         return {};
     case QMetaType::QDate: {
-        const QDate date = QDate::fromString(text, Qt::ISODate);
+        const QDate date = QDate::fromString(trimmedText, Qt::ISODate);
         return date.isValid() ? QVariant(date) : QVariant{};
     }
     case QMetaType::QTime: {
-        const QTime time = QTime::fromString(text, Qt::ISODateWithMs);
+        const QTime time = QTime::fromString(trimmedText, Qt::ISODateWithMs);
         return time.isValid() ? QVariant(time) : QVariant{};
     }
     case QMetaType::QDateTime: {
-        const QDateTime dateTime = QDateTime::fromString(text, Qt::ISODateWithMs);
+        const QDateTime dateTime = QDateTime::fromString(trimmedText, Qt::ISODateWithMs);
         return dateTime.isValid() ? QVariant(dateTime) : QVariant{};
     }
-    default:
-        return value.toString();
+    case QMetaType::QUuid: {
+        const QUuid uuid = QUuid::fromString(trimmedText);
+        if (!uuid.isNull()
+            || trimmedText == QStringLiteral("00000000-0000-0000-0000-000000000000")
+            || trimmedText == QStringLiteral("{00000000-0000-0000-0000-000000000000}"))
+            return uuid;
+        return {};
+    }
+    case QMetaType::QByteArray:
+        return value.metaType().id() == QMetaType::QByteArray
+            ? value : QVariant(rawText.toUtf8());
+    default: {
+        if (value.metaType() == original.metaType())
+            return value;
+        QVariant converted = value;
+        return converted.convert(original.metaType()) ? converted : QVariant{};
+    }
     }
 }
 

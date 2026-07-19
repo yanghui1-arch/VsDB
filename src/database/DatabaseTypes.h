@@ -8,6 +8,8 @@
 
 namespace vsdb {
 
+inline constexpr qint64 DefaultQueryMemoryLimitBytes = 256LL * 1024 * 1024;
+
 struct PostgresConnectionConfig
 {
     QString host = QStringLiteral("localhost");

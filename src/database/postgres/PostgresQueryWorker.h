@@ -16,7 +16,7 @@ struct PostgresQueryRequest
     QString sql;
     int rowLimit = 100;
     int batchSize = 32;
-    qint64 memoryLimitBytes = 64 * 1024 * 1024;
+    qint64 memoryLimitBytes = DefaultQueryMemoryLimitBytes;
 };
 
 class PostgresQueryWorker final : public QObject

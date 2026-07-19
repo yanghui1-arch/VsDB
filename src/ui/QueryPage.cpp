@@ -315,7 +315,8 @@ void QueryPage::finishExecution(qlonglong affectedRows, bool truncated,
         if (loadedBytes > 0)
             message += QStringLiteral(" · %1").arg(QLocale().formattedDataSize(loadedBytes));
         if (memoryLimited)
-            message += QStringLiteral(" · 已达到 64 MB 内存保护上限");
+            message += QStringLiteral(" · 已达到 %1 内存保护上限")
+                           .arg(QLocale().formattedDataSize(DefaultQueryMemoryLimitBytes));
         else if (truncated)
             message += QStringLiteral(" · 已达到显示上限");
     } else {
