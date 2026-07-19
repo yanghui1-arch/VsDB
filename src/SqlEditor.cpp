@@ -110,7 +110,8 @@ SqlHighlighter::SqlHighlighter(QTextDocument *document) : QSyntaxHighlighter(doc
 
     QTextCharFormat schema;
     schema.setForeground(QColor(QStringLiteral("#D6D7DD")));
-    rules_.append({QRegularExpression(QStringLiteral("\\b(public|analytics)\\.[A-Za-z_][A-Za-z0-9_]*\\b")), schema});
+    rules_.append({QRegularExpression(
+        QStringLiteral("\\b[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*\\b")), schema});
 
     QTextCharFormat string;
     string.setForeground(QColor(QStringLiteral("#FC6A5D")));

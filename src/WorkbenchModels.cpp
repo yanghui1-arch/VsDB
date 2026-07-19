@@ -1,133 +1,181 @@
 #include "WorkbenchModels.h"
 
 #include <QColor>
+#include <QDate>
+#include <QDateTime>
 #include <QPainter>
-#include <QStringList>
+#include <QTime>
+#include <QUuid>
+
+#include <utility>
 
 namespace vsdb {
-
-namespace {
-const QStringList kNames{
-    QStringLiteral("alice"), QStringLiteral("bob"), QStringLiteral("carol"),
-    QStringLiteral("dave"), QStringLiteral("eve"), QStringLiteral("frank"),
-    QStringLiteral("grace"), QStringLiteral("heidi"), QStringLiteral("ivan"),
-    QStringLiteral("judy"), QStringLiteral("mallory"), QStringLiteral("oscar")};
-const QStringList kStatuses{
-    QStringLiteral("completed"), QStringLiteral("shipped"), QStringLiteral("completed"),
-    QStringLiteral("pending"), QStringLiteral("completed"), QStringLiteral("shipped"),
-    QStringLiteral("cancelled"), QStringLiteral("completed")};
-const QStringList kHeaders{
-    QStringLiteral("id\nint8"), QStringLiteral("email\ntext"),
-    QStringLiteral("created_at\ntimestamptz"), QStringLiteral("order_id\nint8"),
-    QStringLiteral("total\nnumeric"), QStringLiteral("status\ntext")};
-}
 
 ResultTableModel::ResultTableModel(QObject *parent) : QAbstractTableModel(parent) {}
 
 int ResultTableModel::rowCount(const QModelIndex &parent) const
 {
-    return parent.isValid() ? 0 : visibleRows_;
+    return parent.isValid() ? 0 : result_.rows.size();
 }
 
 int ResultTableModel::columnCount(const QModelIndex &parent) const
 {
-    return parent.isValid() ? 0 : kHeaders.size();
+    return parent.isValid() ? 0 : result_.columns.size();
 }
 
 QVariant ResultTableModel::data(const QModelIndex &index, int role) const
 {
-    if (!index.isValid() || index.row() >= visibleRows_)
+    if (!index.isValid() || index.row() >= result_.rows.size()
+        || index.column() >= result_.columns.size())
         return {};
 
-    if (role == Qt::TextAlignmentRole && (index.column() == 0 || index.column() == 3 || index.column() == 4))
-        return QVariant::fromValue(Qt::AlignRight | Qt::AlignVCenter);
     const quint64 key = cellKey(index.row(), index.column());
+    const QVariant value = pendingValues_.contains(key)
+        ? pendingValues_.value(key) : result_.rows.at(index.row()).at(index.column());
+
     if (role == Qt::BackgroundRole && pendingValues_.contains(key))
         return QColor(QStringLiteral("#3A3020"));
-    if (role == Qt::ToolTipRole && pendingValues_.contains(key))
-        return QStringLiteral("Pending change — apply or revert the transaction");
+    if (role == Qt::ToolTipRole) {
+        if (pendingValues_.contains(key))
+            return QStringLiteral("待提交修改");
+        if (value.metaType().id() == QMetaType::QString && value.toString().size() > 512)
+            return QStringLiteral("完整内容包含 %1 个字符；复制、导出或编辑时仍使用完整值。")
+                .arg(value.toString().size());
+        if (value.metaType().id() == QMetaType::QByteArray)
+            return QStringLiteral("二进制内容共 %1 字节；导出时仍使用完整值。")
+                .arg(value.toByteArray().size());
+    }
+    if (role == Qt::ForegroundRole && value.isNull())
+        return QColor(QStringLiteral("#747885"));
+    if (role == Qt::TextAlignmentRole) {
+        switch (value.metaType().id()) {
+        case QMetaType::Int:
+        case QMetaType::UInt:
+        case QMetaType::LongLong:
+        case QMetaType::ULongLong:
+        case QMetaType::Double:
+        case QMetaType::Float:
+            return QVariant::fromValue(Qt::AlignRight | Qt::AlignVCenter);
+        default:
+            return QVariant::fromValue(Qt::AlignLeft | Qt::AlignVCenter);
+        }
+    }
     if (role != Qt::DisplayRole && role != Qt::EditRole)
         return {};
-
-    if (const auto pending = pendingValues_.constFind(key); pending != pendingValues_.constEnd())
-        return pending.value();
-    if (const auto committed = committedValues_.constFind(key); committed != committedValues_.constEnd())
-        return committed.value();
-    return generatedValue(index);
+    if (role == Qt::DisplayRole && value.isNull())
+        return QStringLiteral("NULL");
+    return role == Qt::DisplayRole ? displayValue(value) : value;
 }
 
 bool ResultTableModel::setData(const QModelIndex &index, const QVariant &value, int role)
 {
-    if (role != Qt::EditRole || !index.isValid() || index.row() >= visibleRows_)
+    if (role != Qt::EditRole || !editable_ || !index.isValid()
+        || index.row() >= result_.rows.size() || index.column() >= result_.columns.size())
         return false;
 
+    const quint64 key = cellKey(index.row(), index.column());
+    const QVariant original = result_.rows.at(index.row()).at(index.column());
     const QVariant normalized = normalizedValue(index, value);
     if (!normalized.isValid())
         return false;
 
-    const quint64 key = cellKey(index.row(), index.column());
-    const QVariant committed = committedValues_.value(key, generatedValue(index));
-    if (normalized == committed)
+    const bool hadPendingValue = pendingValues_.contains(key);
+    const bool unchanged = (normalized.isNull() && original.isNull())
+        || normalized == original;
+    if (unchanged) {
+        if (!hadPendingValue)
+            return true;
         pendingValues_.remove(key);
-    else
+    } else {
+        if (hadPendingValue && pendingValues_.value(key) == normalized)
+            return true;
         pendingValues_.insert(key, normalized);
+    }
 
     emit dataChanged(index, index,
-                     {Qt::DisplayRole, Qt::EditRole, Qt::BackgroundRole, Qt::ToolTipRole});
+                     {Qt::DisplayRole, Qt::EditRole, Qt::BackgroundRole,
+                      Qt::ForegroundRole, Qt::ToolTipRole});
     return true;
 }
 
 Qt::ItemFlags ResultTableModel::flags(const QModelIndex &index) const
 {
-    if (!index.isValid())
-        return QAbstractTableModel::flags(index);
-    return QAbstractTableModel::flags(index) | Qt::ItemIsEditable;
+    Qt::ItemFlags result = QAbstractTableModel::flags(index);
+    if (index.isValid() && editable_)
+        result |= Qt::ItemIsEditable;
+    return result;
 }
 
-quint64 ResultTableModel::cellKey(int row, int column)
+QVariant ResultTableModel::headerData(int section, Qt::Orientation orientation, int role) const
 {
-    return (static_cast<quint64>(static_cast<quint32>(row)) << 32)
-        | static_cast<quint32>(column);
+    if (role == Qt::DisplayRole) {
+        if (orientation == Qt::Horizontal && section >= 0 && section < result_.columns.size()) {
+            const QueryColumn &column = result_.columns.at(section);
+            return column.name + QLatin1Char('\n') + column.type;
+        }
+        if (orientation == Qt::Vertical)
+            return section + 1;
+    }
+    if (role == Qt::TextAlignmentRole)
+        return QVariant::fromValue(Qt::AlignLeft | Qt::AlignVCenter);
+    return {};
 }
 
-QVariant ResultTableModel::generatedValue(const QModelIndex &index) const
+void ResultTableModel::setResult(QueryResult result, bool editable)
 {
-    const int row = index.row();
-    const QString &name = kNames.at(row % kNames.size());
-
-    switch (index.column()) {
-    case 0: return static_cast<qlonglong>(1001 + row);
-    case 1: return name + QStringLiteral("@example.com");
-    case 2:
-        return QStringLiteral("2026-07-%1 %2:%3:%4+08")
-            .arg(12 - (row % 8), 2, 10, QLatin1Char('0'))
-            .arg(9 + (row % 10), 2, 10, QLatin1Char('0'))
-            .arg((row * 7) % 60, 2, 10, QLatin1Char('0'))
-            .arg((row * 13) % 60, 2, 10, QLatin1Char('0'));
-    case 3: return static_cast<qlonglong>(5001 + row);
-    case 4: return QString::number(15.0 + ((row * 1749) % 18500) / 100.0, 'f', 2);
-    case 5: return kStatuses.at(row % kStatuses.size());
-    default: return {};
-    }
+    beginResetModel();
+    result_ = std::move(result);
+    pendingValues_.clear();
+    editable_ = editable;
+    endResetModel();
 }
 
-QVariant ResultTableModel::normalizedValue(const QModelIndex &index, const QVariant &value) const
+void ResultTableModel::beginResult(QVector<QueryColumn> columns, bool select,
+                                   bool editable)
 {
-    const QString text = value.toString().trimmed();
-    if (text.isEmpty())
-        return {};
+    beginResetModel();
+    result_ = {};
+    result_.columns = std::move(columns);
+    result_.select = select;
+    pendingValues_.clear();
+    editable_ = editable;
+    endResetModel();
+}
 
-    if (index.column() == 0 || index.column() == 3) {
-        bool ok = false;
-        const qlonglong number = text.toLongLong(&ok);
-        return ok ? QVariant(number) : QVariant{};
+void ResultTableModel::appendRows(QVector<QVariantList> rows)
+{
+    if (rows.isEmpty())
+        return;
+
+    const int first = result_.rows.size();
+    const int last = first + rows.size() - 1;
+    beginInsertRows({}, first, last);
+    result_.rows.reserve(last + 1);
+    for (QVariantList &row : rows)
+        result_.rows.append(std::move(row));
+    endInsertRows();
+}
+
+const QVector<QueryColumn> &ResultTableModel::columns() const
+{
+    return result_.columns;
+}
+
+const QVector<QVariantList> &ResultTableModel::originalRows() const
+{
+    return result_.rows;
+}
+
+QVector<CellChange> ResultTableModel::pendingChanges() const
+{
+    QVector<CellChange> changes;
+    changes.reserve(pendingValues_.size());
+    for (auto pending = pendingValues_.constBegin(); pending != pendingValues_.constEnd(); ++pending) {
+        const int row = keyRow(pending.key());
+        const int column = keyColumn(pending.key());
+        changes.append({row, column, result_.rows.at(row).at(column), pending.value()});
     }
-    if (index.column() == 4) {
-        bool ok = false;
-        const double number = text.toDouble(&ok);
-        return ok ? QVariant(QString::number(number, 'f', 2)) : QVariant{};
-    }
-    return text;
+    return changes;
 }
 
 int ResultTableModel::pendingChangeCount() const
@@ -135,11 +183,16 @@ int ResultTableModel::pendingChangeCount() const
     return pendingValues_.size();
 }
 
+bool ResultTableModel::isEditable() const
+{
+    return editable_;
+}
+
 void ResultTableModel::commitPendingChanges()
 {
     const QList<quint64> keys = pendingValues_.keys();
-    for (auto it = pendingValues_.constBegin(); it != pendingValues_.constEnd(); ++it)
-        committedValues_.insert(it.key(), it.value());
+    for (auto pending = pendingValues_.constBegin(); pending != pendingValues_.constEnd(); ++pending)
+        result_.rows[keyRow(pending.key())][keyColumn(pending.key())] = pending.value();
     pendingValues_.clear();
     notifyChangedCells(keys);
 }
@@ -151,38 +204,126 @@ void ResultTableModel::rollbackPendingChanges()
     notifyChangedCells(keys);
 }
 
+quint64 ResultTableModel::cellKey(int row, int column)
+{
+    return (static_cast<quint64>(static_cast<quint32>(row)) << 32)
+        | static_cast<quint32>(column);
+}
+
+int ResultTableModel::keyRow(quint64 key)
+{
+    return static_cast<int>(key >> 32);
+}
+
+int ResultTableModel::keyColumn(quint64 key)
+{
+    return static_cast<int>(key & 0xffffffffu);
+}
+
+QVariant ResultTableModel::displayValue(const QVariant &value)
+{
+    constexpr qsizetype previewLength = 512;
+    if (value.metaType().id() == QMetaType::QString) {
+        const QString text = value.toString();
+        if (text.size() > previewLength) {
+            return text.left(previewLength)
+                + QStringLiteral("…（完整值共 %1 个字符）").arg(text.size());
+        }
+    } else if (value.metaType().id() == QMetaType::QByteArray) {
+        return QStringLiteral("二进制数据（%1 字节）").arg(value.toByteArray().size());
+    }
+    return value;
+}
+
+QVariant ResultTableModel::normalizedValue(const QModelIndex &index,
+                                           const QVariant &value) const
+{
+    const QVariant original = result_.rows.at(index.row()).at(index.column());
+    const QString rawText = value.toString();
+    const QString trimmedText = rawText.trimmed();
+    if (original.isNull() && (value.isNull() || rawText.isEmpty()))
+        return original;
+    if (trimmedText.compare(QStringLiteral("NULL"), Qt::CaseInsensitive) == 0)
+        return QVariant(original.metaType());
+
+    bool ok = false;
+    switch (original.metaType().id()) {
+    case QMetaType::QString:
+        return rawText;
+    case QMetaType::Int: {
+        const int number = trimmedText.toInt(&ok);
+        return ok ? QVariant(number) : QVariant{};
+    }
+    case QMetaType::UInt: {
+        const uint number = trimmedText.toUInt(&ok);
+        return ok ? QVariant(number) : QVariant{};
+    }
+    case QMetaType::LongLong: {
+        const qlonglong number = trimmedText.toLongLong(&ok);
+        return ok ? QVariant(number) : QVariant{};
+    }
+    case QMetaType::ULongLong: {
+        const qulonglong number = trimmedText.toULongLong(&ok);
+        return ok ? QVariant(number) : QVariant{};
+    }
+    case QMetaType::Double: {
+        const double number = trimmedText.toDouble(&ok);
+        return ok ? QVariant(number) : QVariant{};
+    }
+    case QMetaType::Float: {
+        const float number = trimmedText.toFloat(&ok);
+        return ok ? QVariant(number) : QVariant{};
+    }
+    case QMetaType::Bool:
+        if (trimmedText.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0
+            || trimmedText == QStringLiteral("1"))
+            return true;
+        if (trimmedText.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0
+            || trimmedText == QStringLiteral("0"))
+            return false;
+        return {};
+    case QMetaType::QDate: {
+        const QDate date = QDate::fromString(trimmedText, Qt::ISODate);
+        return date.isValid() ? QVariant(date) : QVariant{};
+    }
+    case QMetaType::QTime: {
+        const QTime time = QTime::fromString(trimmedText, Qt::ISODateWithMs);
+        return time.isValid() ? QVariant(time) : QVariant{};
+    }
+    case QMetaType::QDateTime: {
+        const QDateTime dateTime = QDateTime::fromString(trimmedText, Qt::ISODateWithMs);
+        return dateTime.isValid() ? QVariant(dateTime) : QVariant{};
+    }
+    case QMetaType::QUuid: {
+        const QUuid uuid = QUuid::fromString(trimmedText);
+        if (!uuid.isNull()
+            || trimmedText == QStringLiteral("00000000-0000-0000-0000-000000000000")
+            || trimmedText == QStringLiteral("{00000000-0000-0000-0000-000000000000}"))
+            return uuid;
+        return {};
+    }
+    case QMetaType::QByteArray:
+        return value.metaType().id() == QMetaType::QByteArray
+            ? value : QVariant(rawText.toUtf8());
+    default: {
+        if (value.metaType() == original.metaType())
+            return value;
+        QVariant converted = value;
+        return converted.convert(original.metaType()) ? converted : QVariant{};
+    }
+    }
+}
+
 void ResultTableModel::notifyChangedCells(const QList<quint64> &keys)
 {
     for (const quint64 key : keys) {
-        const int row = static_cast<int>(key >> 32);
-        const int column = static_cast<int>(key & 0xffffffffu);
-        if (row < visibleRows_)
+        const int row = keyRow(key);
+        const int column = keyColumn(key);
+        if (row < result_.rows.size() && column < result_.columns.size())
             emit dataChanged(index(row, column), index(row, column),
-                             {Qt::DisplayRole, Qt::EditRole, Qt::BackgroundRole, Qt::ToolTipRole});
+                             {Qt::DisplayRole, Qt::EditRole, Qt::BackgroundRole,
+                              Qt::ForegroundRole, Qt::ToolTipRole});
     }
-}
-
-QVariant ResultTableModel::headerData(int section, Qt::Orientation orientation, int role) const
-{
-    if (role == Qt::DisplayRole) {
-        if (orientation == Qt::Horizontal && section >= 0 && section < kHeaders.size())
-            return kHeaders.at(section);
-        if (orientation == Qt::Vertical)
-            return section + 1;
-    }
-    if (role == Qt::TextAlignmentRole)
-        return QVariant::fromValue(Qt::AlignLeft | Qt::AlignVCenter);
-    return {};
-}
-
-void ResultTableModel::setVisibleRows(int rows)
-{
-    rows = qBound(1, rows, 1000);
-    if (rows == visibleRows_)
-        return;
-    beginResetModel();
-    visibleRows_ = rows;
-    endResetModel();
 }
 
 TwoLineHeaderView::TwoLineHeaderView(Qt::Orientation orientation, QWidget *parent)

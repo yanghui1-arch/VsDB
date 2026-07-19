@@ -56,6 +56,27 @@ int main(int argc, char *argv[])
 
     vsdb::MainWindow window;
     if (!screenshotPath.isEmpty()) {
+        const QString screenshotHost = qEnvironmentVariable("VSDB_SCREENSHOT_PG_HOST");
+        if (!screenshotHost.isEmpty()) {
+            vsdb::PostgresConnectionConfig config;
+            config.host = screenshotHost;
+            config.port = qEnvironmentVariableIntValue("VSDB_SCREENSHOT_PG_PORT");
+            if (config.port <= 0)
+                config.port = 5432;
+            config.user = qEnvironmentVariable("VSDB_SCREENSHOT_PG_USER", QStringLiteral("postgres"));
+            config.password = qEnvironmentVariable("VSDB_SCREENSHOT_PG_PASSWORD");
+            config.database = qEnvironmentVariable("VSDB_SCREENSHOT_PG_DATABASE", QStringLiteral("postgres"));
+            config.sslMode = qEnvironmentVariable("VSDB_SCREENSHOT_PG_SSLMODE", QStringLiteral("prefer"));
+            QString error;
+            if (!window.connectToPostgres(config, &error))
+                return 3;
+            const QString relation = qEnvironmentVariable("VSDB_SCREENSHOT_PG_RELATION");
+            if (!relation.isEmpty()) {
+                const QString schema = qEnvironmentVariable("VSDB_SCREENSHOT_PG_SCHEMA", QStringLiteral("public"));
+                if (!window.openRelationPreview(schema, relation, &error))
+                    return 4;
+            }
+        }
         window.resize(1560, 920);
         window.show();
         QEventLoop paintLoop;
