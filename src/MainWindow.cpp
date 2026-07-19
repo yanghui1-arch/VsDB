@@ -3,6 +3,7 @@
 #include "SqlEditor.h"
 #include "UiComponents.h"
 #include "WorkbenchModels.h"
+#include "database/postgres/PostgresQueryWorker.h"
 #include "ui/IconProvider.h"
 #include "ui/PostgresConnectionDialog.h"
 #include "ui/QueryPage.h"
@@ -11,7 +12,6 @@
 #include <QApplication>
 #include <QCloseEvent>
 #include <QComboBox>
-#include <QEventLoop>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHeaderView>
@@ -19,6 +19,7 @@
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QMenu>
+#include <QMetaObject>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPaintEvent>
@@ -35,6 +36,7 @@
 #include <QTabBar>
 #include <QTableView>
 #include <QTextDocument>
+#include <QThread>
 #include <QToolBar>
 #include <QToolButton>
 #include <QTreeView>
@@ -267,6 +269,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
     populateSchema();
     installActions();
+    initializeQueryWorker();
     addQuery(kInitialSql);
     updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
     updateConnectionUi();
@@ -276,8 +279,24 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     mainSplitter_->restoreState(settings.value(QStringLiteral("window/mainSplitter")).toByteArray());
 }
 
+MainWindow::~MainWindow()
+{
+    if (!queryThread_)
+        return;
+    if (queryWorker_)
+        queryWorker_->requestCancel();
+    if (runningBackendPid_ > 0 && postgres_.isConnected()) {
+        QString ignoredError;
+        postgres_.cancelBackend(runningBackendPid_, &ignoredError);
+    }
+    queryThread_->quit();
+    queryThread_->wait();
+    queryWorker_ = nullptr;
+}
+
 bool MainWindow::connectToPostgres(const PostgresConnectionConfig &config, QString *error)
 {
+    cancelRunningQuery();
     if (!postgres_.connectToServer(config, error))
         return false;
     updateConnectionUi();
@@ -298,19 +317,17 @@ bool MainWindow::openRelationPreview(const QString &schema, const QString &relat
     const DatabaseTable table = postgres_.describeTable(schema, relation, error);
     if (error && !error->isEmpty())
         return false;
-    const QString sql = QStringLiteral("SELECT *\nFROM %1\nLIMIT 100;")
-                            .arg(postgres_.qualifiedName(schema, relation));
-    addQuery(sql);
+    const RelationPreviewQuery preview = postgres_.buildRelationPreview(table);
+    addQuery(preview.sql);
     QueryPage *page = currentQuery();
     const bool editable = !table.primaryKeys().isEmpty();
     if (editable)
         page->setTableContext(schema, relation, table.primaryKeys());
-    page->beginExecution();
-    QueryResult result = postgres_.execute(sql, page->rowLimit(), error);
-    if (error && !error->isEmpty())
-        return false;
-    page->setQueryResult(std::move(result), editable);
+    if (!preview.omittedColumns.isEmpty())
+        page->setResultNotice(QStringLiteral("已省略 %1 个大字段")
+                                  .arg(preview.omittedColumns.size()));
     updateInspector(table);
+    runQuery(page, editable);
     return true;
 }
 
@@ -353,6 +370,7 @@ void MainWindow::createDatabaseToolBar()
     reconnectAction_ = addAction(QStringLiteral("refresh-cw"), QStringLiteral("重新连接"),
                                  QStringLiteral("重新连接并刷新结构"));
     connect(reconnectAction_, &QAction::triggered, this, [this] {
+        cancelRunningQuery();
         QString error;
         if (!postgres_.reconnect(&error)) {
             showDatabaseError(QStringLiteral("重新连接失败"), error);
@@ -365,6 +383,7 @@ void MainWindow::createDatabaseToolBar()
     disconnectAction_ = addAction(QStringLiteral("unplug"), QStringLiteral("断开连接"),
                                   QStringLiteral("断开 PostgreSQL 连接"));
     connect(disconnectAction_, &QAction::triggered, this, [this] {
+        cancelRunningQuery();
         postgres_.disconnect();
         updateConnectionUi();
         populateSchema();
@@ -780,6 +799,54 @@ QueryPage *MainWindow::currentQuery() const
     return qobject_cast<QueryPage *>(queryTabs_->currentWidget());
 }
 
+void MainWindow::initializeQueryWorker()
+{
+    qRegisterMetaType<QVector<QueryColumn>>();
+    qRegisterMetaType<QVector<QVariantList>>();
+
+    queryThread_ = new QThread(this);
+    queryWorker_ = new PostgresQueryWorker;
+    queryWorker_->moveToThread(queryThread_);
+    connect(queryThread_, &QThread::finished, queryWorker_, &QObject::deleteLater);
+
+    connect(queryWorker_, &PostgresQueryWorker::backendReady, this,
+            [this](quint64 requestId, qint64 backendPid) {
+        if (requestId == runningQueryId_ && runningQueryPage_)
+            runningBackendPid_ = backendPid;
+    });
+    connect(queryWorker_, &PostgresQueryWorker::resultSetReady, this,
+            [this](quint64 requestId, QVector<QueryColumn> columns, bool select) {
+        if (requestId != runningQueryId_ || !runningQueryPage_)
+            return;
+        runningQueryPage_->beginResult(std::move(columns), select,
+                                       runningQueryEditable_ && select);
+    });
+    connect(queryWorker_, &PostgresQueryWorker::rowsReady, this,
+            [this](quint64 requestId, QVector<QVariantList> rows, qint64 loadedBytes) {
+        if (requestId != runningQueryId_ || !runningQueryPage_)
+            return;
+        runningQueryPage_->appendResultRows(std::move(rows), loadedBytes);
+    });
+    connect(queryWorker_, &PostgresQueryWorker::finished, this,
+            [this](quint64 requestId, qlonglong affectedRows, bool truncated,
+                   bool memoryLimited, bool cancelled, qint64 loadedBytes,
+                   const QString &error) {
+        if (requestId != runningQueryId_)
+            return;
+        QPointer<QueryPage> page = runningQueryPage_;
+        runningQueryPage_.clear();
+        runningBackendPid_ = -1;
+        runningQueryEditable_ = false;
+        if (!page)
+            return;
+        page->finishExecution(affectedRows, truncated, memoryLimited,
+                              cancelled, loadedBytes, error);
+        if (!error.isEmpty())
+            showDatabaseError(QStringLiteral("SQL 执行失败"), error);
+    });
+    queryThread_->start();
+}
+
 void MainWindow::executeQuery()
 {
     QueryPage *page = currentQuery();
@@ -803,25 +870,57 @@ void MainWindow::runQuery(QueryPage *page, bool editableTable)
         page->setStatus(QStringLiteral("请输入要执行的 SQL"));
         return;
     }
-
-    page->beginExecution();
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    QString error;
-    QueryResult result = postgres_.execute(sql, page->rowLimit(), &error);
-    QApplication::restoreOverrideCursor();
-    if (!error.isEmpty()) {
-        page->setStatus(QStringLiteral("执行失败：%1").arg(error));
-        showDatabaseError(QStringLiteral("SQL 执行失败"), error);
+    if (runningQueryPage_) {
+        page->setStatus(runningQueryPage_ == page
+            ? QStringLiteral("当前查询仍在执行，可按 Esc 取消")
+            : QStringLiteral("另一项查询正在执行；完成后可继续执行"));
         return;
     }
-    page->setQueryResult(std::move(result), editableTable);
+
+    page->beginExecution();
+    runningQueryPage_ = page;
+    runningBackendPid_ = -1;
+    runningQueryEditable_ = editableTable;
+    const quint64 requestId = ++runningQueryId_;
+
+    PostgresQueryRequest request;
+    request.id = requestId;
+    request.config = postgres_.config();
+    request.sessionUser = postgres_.currentUser();
+    request.sql = sql;
+    request.rowLimit = page->rowLimit();
+
+    queryWorker_->prepareRequest();
+    PostgresQueryWorker *worker = queryWorker_;
+    QMetaObject::invokeMethod(worker,
+        [worker, request = std::move(request)]() mutable {
+            worker->execute(std::move(request));
+        },
+        Qt::QueuedConnection);
+}
+
+void MainWindow::cancelRunningQuery()
+{
+    if (!runningQueryPage_ || !queryWorker_)
+        return;
+
+    queryWorker_->requestCancel();
+    runningQueryPage_->setStatus(QStringLiteral("正在取消查询…"));
+    if (runningBackendPid_ > 0 && postgres_.isConnected()) {
+        QString ignoredError;
+        postgres_.cancelBackend(runningBackendPid_, &ignoredError);
+    }
 }
 
 void MainWindow::stopQuery()
 {
-    if (QueryPage *page = currentQuery())
-        page->setStatus(QStringLiteral("当前没有异步执行中的查询"));
+    QueryPage *page = currentQuery();
+    if (!runningQueryPage_ || page != runningQueryPage_) {
+        if (page)
+            page->setStatus(QStringLiteral("当前标签没有执行中的查询"));
+        return;
+    }
+    cancelRunningQuery();
 }
 
 void MainWindow::refreshSchema()
@@ -839,6 +938,8 @@ void MainWindow::closeQuery(int index)
     if (index < 0)
         return;
     QWidget *page = queryTabs_->widget(index);
+    if (page == runningQueryPage_)
+        cancelRunningQuery();
     queryTabs_->removeTab(index);
     page->deleteLater();
     if (queryTabs_->count() == 0)
@@ -879,6 +980,7 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
     QString error;
 
     if (type == QStringLiteral("user")) {
+        cancelRunningQuery();
         QApplication::setOverrideCursor(Qt::WaitCursor);
         const bool switched = postgres_.switchUser(name, &error);
         QApplication::restoreOverrideCursor();
@@ -897,6 +999,7 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
             schemaTree_->expand(proxyIndex);
             return;
         }
+        cancelRunningQuery();
         QApplication::setOverrideCursor(Qt::WaitCursor);
         const bool switched = postgres_.switchDatabase(name, &error);
         QApplication::restoreOverrideCursor();
@@ -921,15 +1024,17 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
         return;
     }
 
-    const QString sql = QStringLiteral("SELECT *\nFROM %1\nLIMIT 100;")
-                            .arg(postgres_.qualifiedName(schema, name));
-    addQuery(sql);
+    const RelationPreviewQuery preview = postgres_.buildRelationPreview(table);
+    addQuery(preview.sql);
     QueryPage *page = currentQuery();
     const bool editable = type == QStringLiteral("Table") && !table.primaryKeys().isEmpty();
     if (editable)
         page->setTableContext(schema, name, table.primaryKeys());
     else
         page->clearTableContext();
+    if (!preview.omittedColumns.isEmpty())
+        page->setResultNotice(QStringLiteral("已省略 %1 个大字段")
+                                  .arg(preview.omittedColumns.size()));
     runQuery(page, editable);
 }
 
@@ -1075,6 +1180,7 @@ void MainWindow::showPostgresConnectionDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
 
+    cancelRunningQuery();
     QApplication::setOverrideCursor(Qt::WaitCursor);
     QString error;
     const bool connected = postgres_.connectToServer(dialog.config(), &error);

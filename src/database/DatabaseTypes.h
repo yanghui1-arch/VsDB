@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <QStringList>
+#include <QMetaType>
 #include <QVariant>
 #include <QVector>
 
@@ -88,6 +89,12 @@ struct QueryResult
     bool truncated = false;
 };
 
+struct RelationPreviewQuery
+{
+    QString sql;
+    QStringList omittedColumns;
+};
+
 struct CellChange
 {
     int row = -1;
@@ -97,3 +104,7 @@ struct CellChange
 };
 
 } // namespace vsdb
+
+Q_DECLARE_METATYPE(vsdb::QueryColumn)
+Q_DECLARE_METATYPE(QVector<vsdb::QueryColumn>)
+Q_DECLARE_METATYPE(QVector<QVariantList>)

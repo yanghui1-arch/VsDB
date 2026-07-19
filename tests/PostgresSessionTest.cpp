@@ -1,7 +1,9 @@
 #include "database/postgres/PostgresSession.h"
+#include "database/postgres/PostgresQueryWorker.h"
 
 #include <QCoreApplication>
 #include <iostream>
+#include <utility>
 
 namespace {
 
@@ -22,6 +24,25 @@ bool exec(vsdb::PostgresSession &session, const QString &sql, QString *error)
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
+    vsdb::PostgresSession session;
+    vsdb::DatabaseTable previewTable;
+    previewTable.schema = QStringLiteral("public");
+    previewTable.name = QStringLiteral("events");
+    previewTable.columns = {
+        {QStringLiteral("id"), QStringLiteral("uuid"), false, {}, true},
+        {QStringLiteral("summary"), QStringLiteral("character varying(200)"), true, {}, false},
+        {QStringLiteral("payload"), QStringLiteral("text"), true, {}, false},
+        {QStringLiteral("document"), QStringLiteral("jsonb"), true, {}, false}
+    };
+    const vsdb::RelationPreviewQuery preview = session.buildRelationPreview(previewTable, 50);
+    if (!preview.sql.contains(QStringLiteral("\"id\""))
+        || !preview.sql.contains(QStringLiteral("\"summary\""))
+        || preview.sql.contains(QStringLiteral("\"payload\""))
+        || preview.omittedColumns != QStringList{QStringLiteral("payload"),
+                                                  QStringLiteral("document")}
+        || !preview.sql.endsWith(QStringLiteral("LIMIT 50;")))
+        return fail(21, QStringLiteral("large-column preview query was not bounded"));
+
     const QString host = qEnvironmentVariable("VSDB_TEST_PG_HOST");
     if (host.isEmpty()) {
         std::cout << "VSDB_TEST_PG_HOST is not set; integration test skipped\n";
@@ -38,10 +59,43 @@ int main(int argc, char *argv[])
     config.database = qEnvironmentVariable("VSDB_TEST_PG_DATABASE", "postgres");
     config.sslMode = qEnvironmentVariable("VSDB_TEST_PG_SSLMODE", "disable");
 
-    vsdb::PostgresSession session;
     QString error;
     if (!session.connectToServer(config, &error))
         return fail(1, QStringLiteral("connect failed: %1").arg(error));
+
+    vsdb::PostgresQueryWorker worker;
+    QVector<vsdb::QueryColumn> streamedColumns;
+    QVector<QVariantList> streamedRows;
+    QString workerError;
+    bool workerFinished = false;
+    QObject::connect(&worker, &vsdb::PostgresQueryWorker::resultSetReady,
+                     [&](quint64, QVector<vsdb::QueryColumn> columns, bool) {
+        streamedColumns = std::move(columns);
+    });
+    QObject::connect(&worker, &vsdb::PostgresQueryWorker::rowsReady,
+                     [&](quint64, QVector<QVariantList> rows, qint64) {
+        for (QVariantList &row : rows)
+            streamedRows.append(std::move(row));
+    });
+    QObject::connect(&worker, &vsdb::PostgresQueryWorker::finished,
+                     [&](quint64, qlonglong, bool, bool, bool, qint64,
+                         const QString &queryError) {
+        workerFinished = true;
+        workerError = queryError;
+    });
+    vsdb::PostgresQueryRequest request;
+    request.id = 1;
+    request.config = config;
+    request.sessionUser = config.user;
+    request.sql = QStringLiteral("SELECT value FROM generate_series(1, 3) AS value");
+    request.rowLimit = 10;
+    request.batchSize = 2;
+    worker.prepareRequest();
+    worker.execute(request);
+    if (!workerFinished || !workerError.isEmpty() || streamedColumns.size() != 1
+        || streamedRows.size() != 3 || streamedRows.constLast().constFirst().toInt() != 3)
+        return fail(22, QStringLiteral("streaming query worker failed: %1").arg(workerError));
+
     if (!session.users(&error).contains(config.user) || !error.isEmpty())
         return fail(2, QStringLiteral("users failed: %1").arg(error));
     if (!session.databases(&error).contains(config.database) || !error.isEmpty())

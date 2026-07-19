@@ -31,8 +31,15 @@ public:
 
     void beginExecution();
     qint64 elapsedMilliseconds() const;
+    bool isExecuting() const;
+    void beginResult(QVector<QueryColumn> columns, bool select, bool editable);
+    void appendResultRows(QVector<QVariantList> rows, qint64 loadedBytes);
+    void finishExecution(qlonglong affectedRows, bool truncated,
+                         bool memoryLimited, bool cancelled,
+                         qint64 loadedBytes, const QString &error = {});
     void setQueryResult(QueryResult result, bool editable);
     void setStatus(const QString &message);
+    void setResultNotice(const QString &notice);
 
     void setTableContext(const QString &schema, const QString &table,
                          const QStringList &primaryKeys);
@@ -45,6 +52,7 @@ signals:
     void commitRequested();
 
 private:
+    void configureResultColumns();
     void updateTransactionState();
     void exportCsv();
 
@@ -58,6 +66,9 @@ private:
     QPushButton *commitButton_ = nullptr;
     QPushButton *rollbackButton_ = nullptr;
     QElapsedTimer elapsed_;
+    bool executing_ = false;
+    bool selectResult_ = false;
+    QString resultNotice_;
     QString tableSchema_;
     QString tableName_;
     QStringList primaryKeys_;

@@ -23,6 +23,8 @@ qt_add_executable(VsDB
     src/WorkbenchModels.cpp
     src/WorkbenchModels.h
     src/database/DatabaseTypes.h
+    src/database/postgres/PostgresQueryWorker.cpp
+    src/database/postgres/PostgresQueryWorker.h
     src/database/postgres/PostgresSession.cpp
     src/database/postgres/PostgresSession.h
     src/ui/IconProvider.cpp
@@ -102,6 +104,8 @@ if(BUILD_TESTING)
     add_executable(VsDBPostgresTests
         tests/PostgresSessionTest.cpp
         src/database/DatabaseTypes.h
+        src/database/postgres/PostgresQueryWorker.cpp
+        src/database/postgres/PostgresQueryWorker.h
         src/database/postgres/PostgresSession.cpp
         src/database/postgres/PostgresSession.h
     )

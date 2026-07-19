@@ -34,8 +34,16 @@ QVariant ResultTableModel::data(const QModelIndex &index, int role) const
 
     if (role == Qt::BackgroundRole && pendingValues_.contains(key))
         return QColor(QStringLiteral("#3A3020"));
-    if (role == Qt::ToolTipRole && pendingValues_.contains(key))
-        return QStringLiteral("待提交修改");
+    if (role == Qt::ToolTipRole) {
+        if (pendingValues_.contains(key))
+            return QStringLiteral("待提交修改");
+        if (value.metaType().id() == QMetaType::QString && value.toString().size() > 512)
+            return QStringLiteral("完整内容包含 %1 个字符；复制、导出或编辑时仍使用完整值。")
+                .arg(value.toString().size());
+        if (value.metaType().id() == QMetaType::QByteArray)
+            return QStringLiteral("二进制内容共 %1 字节；导出时仍使用完整值。")
+                .arg(value.toByteArray().size());
+    }
     if (role == Qt::ForegroundRole && value.isNull())
         return QColor(QStringLiteral("#747885"));
     if (role == Qt::TextAlignmentRole) {
@@ -55,7 +63,7 @@ QVariant ResultTableModel::data(const QModelIndex &index, int role) const
         return {};
     if (role == Qt::DisplayRole && value.isNull())
         return QStringLiteral("NULL");
-    return value;
+    return role == Qt::DisplayRole ? displayValue(value) : value;
 }
 
 bool ResultTableModel::setData(const QModelIndex &index, const QVariant &value, int role)
@@ -111,6 +119,32 @@ void ResultTableModel::setResult(QueryResult result, bool editable)
     pendingValues_.clear();
     editable_ = editable;
     endResetModel();
+}
+
+void ResultTableModel::beginResult(QVector<QueryColumn> columns, bool select,
+                                   bool editable)
+{
+    beginResetModel();
+    result_ = {};
+    result_.columns = std::move(columns);
+    result_.select = select;
+    pendingValues_.clear();
+    editable_ = editable;
+    endResetModel();
+}
+
+void ResultTableModel::appendRows(QVector<QVariantList> rows)
+{
+    if (rows.isEmpty())
+        return;
+
+    const int first = result_.rows.size();
+    const int last = first + rows.size() - 1;
+    beginInsertRows({}, first, last);
+    result_.rows.reserve(last + 1);
+    for (QVariantList &row : rows)
+        result_.rows.append(std::move(row));
+    endInsertRows();
 }
 
 const QVector<QueryColumn> &ResultTableModel::columns() const
@@ -175,6 +209,21 @@ int ResultTableModel::keyRow(quint64 key)
 int ResultTableModel::keyColumn(quint64 key)
 {
     return static_cast<int>(key & 0xffffffffu);
+}
+
+QVariant ResultTableModel::displayValue(const QVariant &value)
+{
+    constexpr qsizetype previewLength = 512;
+    if (value.metaType().id() == QMetaType::QString) {
+        const QString text = value.toString();
+        if (text.size() > previewLength) {
+            return text.left(previewLength)
+                + QStringLiteral("…（已省略 %1 个字符）").arg(text.size() - previewLength);
+        }
+    } else if (value.metaType().id() == QMetaType::QByteArray) {
+        return QStringLiteral("二进制数据（%1 字节）").arg(value.toByteArray().size());
+    }
+    return value;
 }
 
 QVariant ResultTableModel::normalizedValue(const QModelIndex &index,

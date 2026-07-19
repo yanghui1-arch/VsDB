@@ -22,6 +22,9 @@ public:
     QVariant headerData(int section, Qt::Orientation orientation,
                         int role = Qt::DisplayRole) const override;
 
+    void beginResult(QVector<QueryColumn> columns, bool select,
+                     bool editable = false);
+    void appendRows(QVector<QVariantList> rows);
     void setResult(QueryResult result, bool editable = false);
     const QVector<QueryColumn> &columns() const;
     const QVector<QVariantList> &originalRows() const;
@@ -35,6 +38,7 @@ private:
     static quint64 cellKey(int row, int column);
     static int keyRow(quint64 key);
     static int keyColumn(quint64 key);
+    static QVariant displayValue(const QVariant &value);
     QVariant normalizedValue(const QModelIndex &index, const QVariant &value) const;
     void notifyChangedCells(const QList<quint64> &keys);
 

@@ -9,10 +9,12 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QFileDialog>
+#include <QFontMetrics>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLabel>
+#include <QLocale>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -167,6 +169,8 @@ QueryPage::QueryPage(const QString &sql, QWidget *parent) : QWidget(parent)
     table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     table_->setEditTriggers(QAbstractItemView::DoubleClicked);
     table_->setSortingEnabled(false);
+    table_->setWordWrap(false);
+    table_->setTextElideMode(Qt::ElideRight);
     table_->verticalHeader()->setDefaultSectionSize(37);
     table_->verticalHeader()->setMinimumWidth(38);
     table_->horizontalHeader()->setFixedHeight(49);
@@ -218,7 +222,7 @@ QueryPage::QueryPage(const QString &sql, QWidget *parent) : QWidget(parent)
         for (const QModelIndex &index : selected) {
             if (!text.isEmpty())
                 text += index.row() == lastRow ? QLatin1Char('\t') : QLatin1Char('\n');
-            text += index.data().toString();
+            text += index.data(Qt::EditRole).toString();
             lastRow = index.row();
         }
         QApplication::clipboard()->setText(text);
@@ -255,6 +259,11 @@ int QueryPage::rowLimit() const
 void QueryPage::beginExecution()
 {
     elapsed_.start();
+    executing_ = true;
+    selectResult_ = false;
+    model_->beginResult({}, false, false);
+    rowLimit_->setEnabled(false);
+    updateTransactionState();
     setStatus(QStringLiteral("正在执行查询…"));
 }
 
@@ -263,35 +272,83 @@ qint64 QueryPage::elapsedMilliseconds() const
     return elapsed_.isValid() ? elapsed_.elapsed() : 0;
 }
 
-void QueryPage::setQueryResult(QueryResult result, bool editable)
+bool QueryPage::isExecuting() const
 {
-    const int rowCount = result.rows.size();
-    const qlonglong affectedRows = result.affectedRows;
-    const bool select = result.select;
-    const bool truncated = result.truncated;
-    model_->setResult(std::move(result), editable);
-    table_->resizeColumnsToContents();
-    for (int column = 0; column < model_->columnCount(); ++column)
-        table_->setColumnWidth(column, qBound(72, table_->columnWidth(column), 240));
+    return executing_;
+}
+
+void QueryPage::beginResult(QVector<QueryColumn> columns, bool select,
+                            bool editable)
+{
+    selectResult_ = select;
+    model_->beginResult(std::move(columns), select, editable);
+    configureResultColumns();
+    if (select)
+        setStatus(QStringLiteral("查询已响应，正在读取结果…"));
+}
+
+void QueryPage::appendResultRows(QVector<QVariantList> rows, qint64 loadedBytes)
+{
+    model_->appendRows(std::move(rows));
+    setStatus(QStringLiteral("正在读取 · %1 行 · %2")
+                  .arg(model_->rowCount())
+                  .arg(QLocale().formattedDataSize(loadedBytes)));
+}
+
+void QueryPage::finishExecution(qlonglong affectedRows, bool truncated,
+                                bool memoryLimited, bool cancelled,
+                                qint64 loadedBytes, const QString &error)
+{
+    executing_ = false;
+    rowLimit_->setEnabled(true);
 
     QString message;
-    if (select) {
-        message = QStringLiteral("查询完成 · %1 行 · %2 毫秒").arg(rowCount).arg(elapsedMilliseconds());
-        if (truncated)
+    if (!error.isEmpty()) {
+        message = QStringLiteral("执行失败 · %1 毫秒 · %2")
+                      .arg(elapsedMilliseconds()).arg(error);
+    } else if (cancelled) {
+        message = QStringLiteral("查询已取消 · 已读取 %1 行 · %2 毫秒")
+                      .arg(model_->rowCount()).arg(elapsedMilliseconds());
+    } else if (selectResult_) {
+        message = QStringLiteral("查询完成 · %1 行 · %2 毫秒")
+                      .arg(model_->rowCount()).arg(elapsedMilliseconds());
+        if (loadedBytes > 0)
+            message += QStringLiteral(" · %1").arg(QLocale().formattedDataSize(loadedBytes));
+        if (memoryLimited)
+            message += QStringLiteral(" · 已达到 64 MB 内存保护上限");
+        else if (truncated)
             message += QStringLiteral(" · 已达到显示上限");
+        if (!resultNotice_.isEmpty())
+            message += QStringLiteral(" · %1").arg(resultNotice_);
     } else {
         message = QStringLiteral("命令执行成功 · 影响 %1 行 · %2 毫秒")
                       .arg(affectedRows).arg(elapsedMilliseconds());
     }
-    messages_->setPlainText(message);
     setStatus(message);
     updateTransactionState();
+}
+
+void QueryPage::setQueryResult(QueryResult result, bool editable)
+{
+    const qlonglong affectedRows = result.affectedRows;
+    const bool select = result.select;
+    const bool truncated = result.truncated;
+    QVector<QueryColumn> columns = std::move(result.columns);
+    QVector<QVariantList> rows = std::move(result.rows);
+    beginResult(std::move(columns), select, editable);
+    model_->appendRows(std::move(rows));
+    finishExecution(affectedRows, truncated, false, false, 0, {});
 }
 
 void QueryPage::setStatus(const QString &message)
 {
     summary_->setText(message);
     messages_->setPlainText(message);
+}
+
+void QueryPage::setResultNotice(const QString &notice)
+{
+    resultNotice_ = notice;
 }
 
 void QueryPage::setTableContext(const QString &schema, const QString &table,
@@ -307,6 +364,7 @@ void QueryPage::clearTableContext()
     tableSchema_.clear();
     tableName_.clear();
     primaryKeys_.clear();
+    resultNotice_.clear();
 }
 
 QString QueryPage::tableSchema() const
@@ -324,11 +382,22 @@ QStringList QueryPage::primaryKeys() const
     return primaryKeys_;
 }
 
+void QueryPage::configureResultColumns()
+{
+    const QFontMetrics metrics(table_->horizontalHeader()->font());
+    for (int column = 0; column < model_->columnCount(); ++column) {
+        const QueryColumn &metadata = model_->columns().at(column);
+        const int contentWidth = qMax(metrics.horizontalAdvance(metadata.name),
+                                      metrics.horizontalAdvance(metadata.type));
+        table_->setColumnWidth(column, qBound(96, contentWidth + 30, 220));
+    }
+}
+
 void QueryPage::updateTransactionState()
 {
     const int changes = model_->pendingChangeCount();
-    commitButton_->setEnabled(changes > 0);
-    rollbackButton_->setEnabled(changes > 0);
+    commitButton_->setEnabled(!executing_ && changes > 0);
+    rollbackButton_->setEnabled(!executing_ && changes > 0);
     commitButton_->setText(changes > 0
         ? QStringLiteral("Commit (%1)").arg(changes) : QStringLiteral("Commit"));
 }

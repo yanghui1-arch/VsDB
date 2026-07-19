@@ -3,6 +3,7 @@
 #include "database/postgres/PostgresSession.h"
 
 #include <QMainWindow>
+#include <QPointer>
 
 class QAction;
 class QComboBox;
@@ -13,16 +14,19 @@ class QSplitter;
 class QStandardItem;
 class QStandardItemModel;
 class QTabWidget;
+class QThread;
 class QTreeView;
 
 namespace vsdb {
 
 class QueryPage;
+class PostgresQueryWorker;
 
 class MainWindow final : public QMainWindow
 {
 public:
     explicit MainWindow(QWidget *parent = nullptr);
+    ~MainWindow() override;
     bool connectToPostgres(const PostgresConnectionConfig &config, QString *error);
     bool openRelationPreview(const QString &schema, const QString &relation, QString *error);
 
@@ -44,6 +48,8 @@ private:
     void addQuery(const QString &sql = {});
     QueryPage *currentQuery() const;
     void runQuery(QueryPage *page, bool editableTable);
+    void initializeQueryWorker();
+    void cancelRunningQuery();
     void updateConnectionUi();
     void showPostgresConnectionDialog();
     void showDatabaseError(const QString &title, const QString &error);
@@ -58,6 +64,12 @@ private:
     void applyPendingChanges(QueryPage *page);
 
     PostgresSession postgres_;
+    QThread *queryThread_ = nullptr;
+    PostgresQueryWorker *queryWorker_ = nullptr;
+    QPointer<QueryPage> runningQueryPage_;
+    quint64 runningQueryId_ = 0;
+    qint64 runningBackendPid_ = -1;
+    bool runningQueryEditable_ = false;
     QSplitter *mainSplitter_ = nullptr;
     QTabWidget *queryTabs_ = nullptr;
     QTreeView *schemaTree_ = nullptr;

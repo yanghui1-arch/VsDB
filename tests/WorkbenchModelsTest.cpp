@@ -63,5 +63,24 @@ int main(int argc, char *argv[])
     model.setResult(result, false);
     if (model.flags(model.index(0, 0)) & Qt::ItemIsEditable)
         return fail(12, "arbitrary query results must be read-only");
+
+    model.beginResult(result.columns, true, false);
+    if (model.rowCount() != 0 || model.columnCount() != 3)
+        return fail(13, "beginning a streamed result must expose columns and clear rows");
+    model.appendRows({result.rows.constFirst()});
+    model.appendRows({result.rows.constLast()});
+    if (model.rowCount() != 2 || model.index(1, 0).data(Qt::EditRole).toLongLong() != 2)
+        return fail(14, "streamed result batches were not appended in order");
+
+    const QString largeText(4096, QLatin1Char('x'));
+    vsdb::QueryResult largeResult;
+    largeResult.select = true;
+    largeResult.columns = {{QStringLiteral("payload"), QStringLiteral("text")}};
+    largeResult.rows = {{largeText}};
+    model.setResult(largeResult, false);
+    const QModelIndex payload = model.index(0, 0);
+    if (payload.data(Qt::DisplayRole).toString().size() >= largeText.size()
+        || payload.data(Qt::EditRole).toString() != largeText)
+        return fail(15, "large values must be previewed without discarding their full value");
     return 0;
 }
