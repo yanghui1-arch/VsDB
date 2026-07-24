@@ -7,6 +7,7 @@
 #include <QPointer>
 
 #include <memory>
+#include <optional>
 
 class QAction;
 class QComboBox;
@@ -64,9 +65,13 @@ private:
     void refreshConnectionPresentation();
     void showPostgresConnectionDialog();
     void editSelectedConnection();
-    bool editConnection(const QString &connectionId, const QString &notice = {});
+    bool editConnection(
+        const QString &connectionId, const QString &notice = {},
+        const std::optional<PostgresConnectionConfig> &initialConfig = std::nullopt);
     void connectSelectedConnection();
-    void connectSavedConnection(const QString &connectionId);
+    void connectSavedConnection(const QString &connectionId,
+                                const QString &database = {});
+    bool persistActiveConnectionConfig(QString *error);
     void removeSelectedConnection();
     void showConnectionContextMenu(const QPoint &position);
     QString connectionIdForIndex(QModelIndex sourceIndex) const;

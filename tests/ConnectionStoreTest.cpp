@@ -113,6 +113,7 @@ int main(int argc, char *argv[])
 
     connection.config.password = QStringLiteral("replacement password");
     connection.config.port = 6432;
+    connection.config.database = QStringLiteral("nexus");
     if (!vsdb::ConnectionStore::upsert(settings, credentials, connection, &error))
         return fail(8, "updating a connection failed");
     if (settings.value(QStringLiteral("connections/order")).toStringList().size() != 1)
@@ -123,6 +124,7 @@ int main(int argc, char *argv[])
     if (updated.size() != 1
         || updated.constFirst().config.password != connection.config.password
         || updated.constFirst().config.port != 6432
+        || updated.constFirst().config.database != QStringLiteral("nexus")
         || updated.constFirst().snapshot.publicTables
             != connection.snapshot.publicTables) {
         return fail(10, "updated connection was not restored");
