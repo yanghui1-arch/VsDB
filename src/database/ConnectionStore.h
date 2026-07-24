@@ -38,7 +38,7 @@ public:
                                          const CredentialStore &credentials,
                                          QStringList *warnings = nullptr);
     static bool upsert(QSettings &settings, CredentialStore &credentials,
-                       SavedConnection *connection, QString *error = nullptr);
+                       SavedConnection &connection, QString *error = nullptr);
     static bool remove(QSettings &settings, CredentialStore &credentials,
                        const QString &connectionId, QString *error = nullptr);
 

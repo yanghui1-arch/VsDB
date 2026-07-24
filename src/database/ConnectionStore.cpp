@@ -63,15 +63,20 @@ public:
             }
             return false;
         }
+        const std::unique_ptr<CREDENTIALW, CredentialDeleter> storedCredential(credential);
 
         if (secret) {
-            const auto *characters =
-                reinterpret_cast<const wchar_t *>(credential->CredentialBlob);
-            *secret = QString::fromWCharArray(
-                characters, static_cast<qsizetype>(
-                                credential->CredentialBlobSize / sizeof(wchar_t)));
+            if (storedCredential->CredentialBlobSize == 0) {
+                secret->clear();
+            } else {
+                const auto *characters = reinterpret_cast<const wchar_t *>(
+                    storedCredential->CredentialBlob);
+                *secret = QString::fromWCharArray(
+                    characters,
+                    static_cast<qsizetype>(
+                        storedCredential->CredentialBlobSize / sizeof(wchar_t)));
+            }
         }
-        CredFree(credential);
         return true;
     }
 
@@ -87,6 +92,15 @@ public:
                                .arg(code));
         return false;
     }
+
+private:
+    struct CredentialDeleter
+    {
+        void operator()(CREDENTIALW *credential) const
+        {
+            CredFree(credential);
+        }
+    };
 };
 
 #else
@@ -185,45 +199,41 @@ QVector<SavedConnection> ConnectionStore::load(
 }
 
 bool ConnectionStore::upsert(QSettings &settings, CredentialStore &credentials,
-                             SavedConnection *connection, QString *error)
+                             SavedConnection &connection, QString *error)
 {
-    if (!connection) {
-        assignError(error, QStringLiteral("没有可保存的连接。"));
-        return false;
-    }
-    if (connection->config.host.isEmpty() || connection->config.user.isEmpty()
-        || connection->config.database.isEmpty() || connection->config.port < 1
-        || connection->config.port > 65535) {
+    if (connection.config.host.isEmpty() || connection.config.user.isEmpty()
+        || connection.config.database.isEmpty() || connection.config.port < 1
+        || connection.config.port > 65535) {
         assignError(error, QStringLiteral("连接地址、端口、用户或数据库无效。"));
         return false;
     }
 
-    const bool isNew = connection->id.isEmpty();
+    const bool isNew = connection.id.isEmpty();
     if (isNew)
-        connection->id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        connection.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    if (!credentials.write(credentialKey(connection->id),
-                           connection->config.password, error)) {
+    if (!credentials.write(credentialKey(connection.id),
+                           connection.config.password, error)) {
         if (isNew)
-            connection->id.clear();
+            connection.id.clear();
         return false;
     }
 
-    settings.beginGroup(profileGroup(connection->id));
+    settings.beginGroup(profileGroup(connection.id));
     settings.setValue(QStringLiteral("driver"), QStringLiteral("QPSQL"));
-    settings.setValue(QStringLiteral("host"), connection->config.host);
-    settings.setValue(QStringLiteral("port"), connection->config.port);
-    settings.setValue(QStringLiteral("user"), connection->config.user);
-    settings.setValue(QStringLiteral("database"), connection->config.database);
-    settings.setValue(QStringLiteral("sslMode"), connection->config.sslMode);
+    settings.setValue(QStringLiteral("host"), connection.config.host);
+    settings.setValue(QStringLiteral("port"), connection.config.port);
+    settings.setValue(QStringLiteral("user"), connection.config.user);
+    settings.setValue(QStringLiteral("database"), connection.config.database);
+    settings.setValue(QStringLiteral("sslMode"), connection.config.sslMode);
     settings.setValue(QStringLiteral("connectTimeout"),
-                      connection->config.connectTimeoutSeconds);
+                      connection.config.connectTimeoutSeconds);
     settings.endGroup();
 
     QStringList order =
         settings.value(QStringLiteral("connections/order")).toStringList();
-    if (!order.contains(connection->id)) {
-        order.append(connection->id);
+    if (!order.contains(connection.id)) {
+        order.append(connection.id);
         settings.setValue(QStringLiteral("connections/order"), order);
     }
     settings.sync();
@@ -231,13 +241,13 @@ bool ConnectionStore::upsert(QSettings &settings, CredentialStore &credentials,
         assignError(error, QStringLiteral("连接配置无法写入本地设置。"));
         if (isNew) {
             QString ignoredError;
-            credentials.remove(credentialKey(connection->id), &ignoredError);
-            connection->id.clear();
+            credentials.remove(credentialKey(connection.id), &ignoredError);
+            connection.id.clear();
         }
         return false;
     }
 
-    connection->hasStoredPassword = true;
+    connection.hasStoredPassword = true;
     return true;
 }
 

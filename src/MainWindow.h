@@ -42,6 +42,7 @@ private:
     QWidget *createInspector();
     void createDatabaseToolBar();
     void populateSchema();
+    void populateActiveConnection(QStandardItem *root);
     void loadSchemaChildren(QStandardItem *item);
     void installActions();
     void updateInspector(const QString &name, const QString &type,
@@ -55,13 +56,15 @@ private:
     void initializeQueryWorker();
     void cancelRunningQuery();
     void updateConnectionUi();
+    void refreshConnectionPresentation();
     void showPostgresConnectionDialog();
     void editSelectedConnection();
-    void editConnection(const QString &connectionId, const QString &notice = {});
+    bool editConnection(const QString &connectionId, const QString &notice = {});
     void connectSelectedConnection();
     void connectSavedConnection(const QString &connectionId);
     void removeSelectedConnection();
     QString selectedConnectionId() const;
+    QString preferredConnectionId() const;
     SavedConnection *savedConnection(const QString &connectionId);
     const SavedConnection *savedConnection(const QString &connectionId) const;
     void showDatabaseError(const QString &title, const QString &error);
