@@ -1,14 +1,19 @@
 #pragma once
 
+#include "database/ConnectionStore.h"
 #include "database/postgres/PostgresSession.h"
 
 #include <QMainWindow>
 #include <QPointer>
 
+#include <memory>
+#include <optional>
+
 class QAction;
 class QComboBox;
 class QLabel;
 class QModelIndex;
+class QPoint;
 class QSortFilterProxyModel;
 class QSplitter;
 class QStandardItem;
@@ -39,10 +44,16 @@ private:
     QWidget *createInspector();
     void createDatabaseToolBar();
     void populateSchema();
+    void populateActiveConnection(QStandardItem *root);
+    void populateCachedConnection(QStandardItem *root,
+                                  const SavedConnection &connection);
+    void updateConnectionSnapshot(QStandardItem *users,
+                                  QStandardItem *databases);
     void loadSchemaChildren(QStandardItem *item);
     void installActions();
     void updateInspector(const QString &name, const QString &type,
                          const QString &schema = {});
+    void updateInspector(const SavedConnection &connection, bool connected);
     void updateInspector(const DatabaseTable &table);
     void clearInspectorModels();
     void addQuery(const QString &sql = {});
@@ -51,7 +62,23 @@ private:
     void initializeQueryWorker();
     void cancelRunningQuery();
     void updateConnectionUi();
+    void refreshConnectionPresentation();
     void showPostgresConnectionDialog();
+    void editSelectedConnection();
+    bool editConnection(
+        const QString &connectionId, const QString &notice = {},
+        const std::optional<PostgresConnectionConfig> &initialConfig = std::nullopt);
+    void connectSelectedConnection();
+    void connectSavedConnection(const QString &connectionId,
+                                const QString &database = {});
+    bool persistActiveConnectionConfig(QString *error);
+    void removeSelectedConnection();
+    void showConnectionContextMenu(const QPoint &position);
+    QString connectionIdForIndex(QModelIndex sourceIndex) const;
+    QString selectedConnectionId() const;
+    QString preferredConnectionId() const;
+    SavedConnection *savedConnection(const QString &connectionId);
+    const SavedConnection *savedConnection(const QString &connectionId) const;
     void showDatabaseError(const QString &title, const QString &error);
 
 private:
@@ -64,6 +91,9 @@ private:
     void applyPendingChanges(QueryPage *page);
 
     PostgresSession postgres_;
+    std::unique_ptr<CredentialStore> credentialStore_;
+    QVector<SavedConnection> savedConnections_;
+    QString activeConnectionId_;
     QThread *queryThread_ = nullptr;
     PostgresQueryWorker *queryWorker_ = nullptr;
     QPointer<QueryPage> runningQueryPage_;

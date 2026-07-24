@@ -52,6 +52,7 @@ constexpr int NameRole = Qt::UserRole;
 constexpr int TypeRole = Qt::UserRole + 1;
 constexpr int SchemaRole = Qt::UserRole + 2;
 constexpr int LoadedRole = Qt::UserRole + 3;
+constexpr int ConnectionIdRole = Qt::UserRole + 4;
 
 const QString kInitialSql = QStringLiteral(
     "SELECT\n"
@@ -93,6 +94,17 @@ QStandardItem *schemaItem(const QString &text, const QString &type,
         item->appendRow(loading);
     }
     return item;
+}
+
+void applyCachedAppearance(QStandardItem *item)
+{
+    item->setForeground(QColor(QStringLiteral("#686C77")));
+    if (!item->icon().isNull()) {
+        item->setIcon(QIcon(item->icon().pixmap(
+            QSize(16, 16), QIcon::Disabled, QIcon::Off)));
+    }
+    for (int row = 0; row < item->rowCount(); ++row)
+        applyCachedAppearance(item->child(row));
 }
 
 void appendReadOnlyRow(QStandardItemModel *model, const QStringList &cells,
@@ -242,7 +254,8 @@ private:
 
 } // namespace
 
-MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent), credentialStore_(createPlatformCredentialStore())
 {
     setWindowTitle(QStringLiteral("VsDB — PostgreSQL 数据库工作台"));
     setMinimumSize(1100, 680);
@@ -267,16 +280,29 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     root->addWidget(mainSplitter_, 1);
     setCentralWidget(rootWidget);
 
+    QSettings settings;
+    QStringList connectionWarnings;
+    savedConnections_ =
+        ConnectionStore::load(settings, *credentialStore_, &connectionWarnings);
+
     populateSchema();
     installActions();
     initializeQueryWorker();
     addQuery(kInitialSql);
-    updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+    if (!savedConnections_.isEmpty())
+        updateInspector(savedConnections_.constFirst(), false);
+    else
+        updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
     updateConnectionUi();
 
-    QSettings settings;
     restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
     mainSplitter_->restoreState(settings.value(QStringLiteral("window/mainSplitter")).toByteArray());
+    if (!connectionWarnings.isEmpty()) {
+        statusBar()->showMessage(
+            QStringLiteral("已加载连接；%1 个连接需要重新输入密码")
+                .arg(connectionWarnings.size()),
+            8000);
+    }
 }
 
 MainWindow::~MainWindow()
@@ -299,9 +325,7 @@ bool MainWindow::connectToPostgres(const PostgresConnectionConfig &config, QStri
     cancelRunningQuery();
     if (!postgres_.connectToServer(config, error))
         return false;
-    updateConnectionUi();
-    populateSchema();
-    updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+    refreshConnectionPresentation();
     return true;
 }
 
@@ -356,24 +380,33 @@ void MainWindow::createDatabaseToolBar()
     toolbar->addWidget(newConnection);
 
     QAction *manage = addAction(QStringLiteral("cloud-cog"), QStringLiteral("连接设置"),
-                                QStringLiteral("编辑 PostgreSQL 连接"));
-    connect(manage, &QAction::triggered, this, &MainWindow::showPostgresConnectionDialog);
+                                QStringLiteral("编辑选中的 PostgreSQL 连接"));
+    connect(manage, &QAction::triggered, this, &MainWindow::editSelectedConnection);
     toolbar->addSeparator();
 
     QAction *connectAction = addAction(QStringLiteral("plug"), QStringLiteral("连接"),
-                                       QStringLiteral("连接 PostgreSQL"));
-    connect(connectAction, &QAction::triggered, this, &MainWindow::showPostgresConnectionDialog);
+                                       QStringLiteral("连接选中的 PostgreSQL 数据库"));
+    connect(connectAction, &QAction::triggered, this, &MainWindow::connectSelectedConnection);
     reconnectAction_ = addAction(QStringLiteral("refresh-cw"), QStringLiteral("重新连接"),
                                  QStringLiteral("重新连接并刷新结构"));
     connect(reconnectAction_, &QAction::triggered, this, [this] {
         cancelRunningQuery();
         QString error;
         if (!postgres_.reconnect(&error)) {
-            showDatabaseError(QStringLiteral("重新连接失败"), error);
+            if (!activeConnectionId_.isEmpty()) {
+                const bool connected = editConnection(
+                    activeConnectionId_,
+                    QStringLiteral("使用已保存凭据重新连接失败：\n%1\n\n请更新连接信息后重试。")
+                        .arg(error));
+                if (!connected)
+                    refreshConnectionPresentation();
+            } else {
+                showDatabaseError(QStringLiteral("重新连接失败"), error);
+                refreshConnectionPresentation();
+            }
             return;
         }
-        updateConnectionUi();
-        populateSchema();
+        refreshConnectionPresentation();
         statusBar()->showMessage(QStringLiteral("PostgreSQL 已重新连接"), 4000);
     });
     disconnectAction_ = addAction(QStringLiteral("unplug"), QStringLiteral("断开连接"),
@@ -381,9 +414,7 @@ void MainWindow::createDatabaseToolBar()
     connect(disconnectAction_, &QAction::triggered, this, [this] {
         cancelRunningQuery();
         postgres_.disconnect();
-        updateConnectionUi();
-        populateSchema();
-        updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+        refreshConnectionPresentation();
         statusBar()->showMessage(QStringLiteral("PostgreSQL 已断开"), 4000);
     });
     toolbar->addSeparator();
@@ -447,24 +478,14 @@ QWidget *MainWindow::createExplorer()
     schemaTree_->setAnimated(false);
     schemaTree_->setIconSize(QSize(16, 16));
     schemaTree_->setIndentation(18);
+    schemaTree_->setContextMenuPolicy(Qt::CustomContextMenu);
     layout->addWidget(schemaTree_, 1);
-
-    auto *footer = new QWidget(pane);
-    footer->setFixedHeight(43);
-    auto *footerLayout = new QHBoxLayout(footer);
-    footerLayout->setContentsMargins(9, 3, 9, 3);
-    QToolButton *add = plainButton(footer, QStringLiteral("＋"), QStringLiteral("添加 PostgreSQL 连接"));
-    QToolButton *refresh = plainButton(footer, QStringLiteral("↻"), QStringLiteral("刷新数据库结构"));
-    footerLayout->addWidget(add);
-    footerLayout->addWidget(refresh);
-    footerLayout->addStretch();
-    layout->addWidget(footer);
-    connect(add, &QToolButton::clicked, this, &MainWindow::showPostgresConnectionDialog);
-    connect(refresh, &QToolButton::clicked, this, &MainWindow::refreshSchema);
 
     connect(schemaTree_->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &MainWindow::handleSchemaSelection);
     connect(schemaTree_, &QTreeView::doubleClicked, this, &MainWindow::activateSchemaItem);
+    connect(schemaTree_, &QTreeView::customContextMenuRequested,
+            this, &MainWindow::showConnectionContextMenu);
     connect(schemaTree_, &QTreeView::expanded, this, [this](const QModelIndex &proxyIndex) {
         const QModelIndex sourceIndex = schemaProxy_->mapToSource(proxyIndex);
         loadSchemaChildren(schemaModel_->itemFromIndex(sourceIndex));
@@ -618,27 +639,74 @@ QWidget *MainWindow::createInspector()
 void MainWindow::populateSchema()
 {
     schemaModel_->clear();
-    if (!postgres_.isConnected()) {
-        auto *root = schemaItem(QStringLiteral("PostgreSQL（未连接）"),
-                                QStringLiteral("connection"), QStringLiteral("postgresql"),
-                                QStringLiteral("PostgreSQL"));
+    QStandardItem *selectedRoot = nullptr;
+    QStandardItem *activeRoot = nullptr;
+
+    for (const SavedConnection &connection : savedConnections_) {
+        const bool active = postgres_.isConnected()
+            && connection.id == activeConnectionId_;
+        const PostgresConnectionConfig &displayConfig =
+            active ? postgres_.config() : connection.config;
+        const QString text = active
+            ? QStringLiteral("PostgreSQL · %1（已连接）")
+                  .arg(displayConfig.displayName())
+            : QStringLiteral("PostgreSQL · %1（未连接）")
+                  .arg(displayConfig.displayName());
+        auto *root = schemaItem(text, QStringLiteral("connection"),
+                                QStringLiteral("postgresql"),
+                                displayConfig.displayName());
+        root->setData(connection.id, ConnectionIdRole);
+        root->setToolTip(active
+            ? QStringLiteral("当前已连接")
+            : QStringLiteral("双击后使用已保存的账号和密码自动连接"));
         schemaModel_->appendRow(root);
-        schemaTree_->setCurrentIndex(schemaProxy_->mapFromSource(root->index()));
-        return;
+        if (!selectedRoot)
+            selectedRoot = root;
+        if (connection.id == activeConnectionId_)
+            selectedRoot = root;
+        if (!active) {
+            populateCachedConnection(root, connection);
+            continue;
+        }
+
+        activeRoot = root;
+        selectedRoot = root;
+        populateActiveConnection(root);
     }
 
-    QString version = postgres_.serverVersion().section(QLatin1Char(' '), 0, 0);
-    auto *root = schemaItem(QStringLiteral("PostgreSQL %1").arg(version),
-                            QStringLiteral("connection"), QStringLiteral("postgresql"),
-                            QStringLiteral("PostgreSQL"));
+    if (postgres_.isConnected() && !activeRoot) {
+        auto *root = schemaItem(
+            QStringLiteral("PostgreSQL · %1（本次会话）")
+                .arg(postgres_.config().displayName()),
+            QStringLiteral("connection"), QStringLiteral("postgresql"),
+            postgres_.config().displayName());
+        schemaModel_->appendRow(root);
+        selectedRoot = root;
+        populateActiveConnection(root);
+    } else if (!selectedRoot) {
+        selectedRoot = schemaItem(
+            QStringLiteral("尚无已保存连接，点击左上角数据库图标添加"),
+            QStringLiteral("empty"), QStringLiteral("postgresql"),
+            QStringLiteral("PostgreSQL"));
+        schemaModel_->appendRow(selectedRoot);
+    }
+
+    if (postgres_.isConnected()) {
+        schemaTree_->setCurrentIndex(
+            schemaProxy_->mapFromSource(selectedRoot->index()));
+    } else {
+        schemaTree_->setCurrentIndex(QModelIndex{});
+    }
+}
+
+void MainWindow::populateActiveConnection(QStandardItem *root)
+{
     auto *users = schemaItem(QStringLiteral("Users"), QStringLiteral("users"),
                              QStringLiteral("key-round"), {}, {}, true);
     auto *databases = schemaItem(QStringLiteral("Databases"), QStringLiteral("databases"),
                                  QStringLiteral("database"), {}, {}, true);
     root->appendRow(users);
     root->appendRow(databases);
-    schemaModel_->appendRow(root);
-
     loadSchemaChildren(users);
     loadSchemaChildren(databases);
     schemaTree_->expand(schemaProxy_->mapFromSource(root->index()));
@@ -657,17 +725,143 @@ void MainWindow::populateSchema()
         schemaTree_->expand(schemaProxy_->mapFromSource(schemas->index()));
         for (int schemaRow = 0; schemaRow < schemas->rowCount(); ++schemaRow) {
             QStandardItem *schema = schemas->child(schemaRow);
-            if (schema->data(NameRole).toString() == QStringLiteral("public")) {
-                loadSchemaChildren(schema);
-                schemaTree_->expand(schemaProxy_->mapFromSource(schema->index()));
-                for (int relationGroup = 0; relationGroup < schema->rowCount(); ++relationGroup)
-                    schemaTree_->expand(schemaProxy_->mapFromSource(schema->child(relationGroup)->index()));
-                break;
+            if (schema->data(NameRole).toString() != QStringLiteral("public"))
+                continue;
+            loadSchemaChildren(schema);
+            schemaTree_->expand(schemaProxy_->mapFromSource(schema->index()));
+            for (int relationGroup = 0; relationGroup < schema->rowCount();
+                 ++relationGroup) {
+                schemaTree_->expand(schemaProxy_->mapFromSource(
+                    schema->child(relationGroup)->index()));
             }
+            break;
         }
         break;
     }
-    schemaTree_->setCurrentIndex(schemaProxy_->mapFromSource(root->index()));
+    updateConnectionSnapshot(users, databases);
+}
+
+void MainWindow::populateCachedConnection(
+    QStandardItem *root, const SavedConnection &connection)
+{
+    QStringList users = connection.snapshot.users;
+    if (!users.contains(connection.config.user))
+        users.prepend(connection.config.user);
+    QStringList databases = connection.snapshot.databases;
+    if (!databases.contains(connection.config.database))
+        databases.prepend(connection.config.database);
+
+    auto *usersItem = schemaItem(QStringLiteral("Users"), QStringLiteral("users"),
+                                 QStringLiteral("key-round"));
+    for (const QString &user : users) {
+        usersItem->appendRow(schemaItem(user, QStringLiteral("user"),
+                                        QStringLiteral("key-round"), user));
+    }
+    root->appendRow(usersItem);
+
+    auto *databasesItem = schemaItem(QStringLiteral("Databases"),
+                                     QStringLiteral("databases"),
+                                     QStringLiteral("database"));
+    root->appendRow(databasesItem);
+    for (const QString &databaseName : databases) {
+        auto *database = schemaItem(databaseName, QStringLiteral("database"),
+                                    QStringLiteral("database"), databaseName);
+        databasesItem->appendRow(database);
+        if (databaseName != connection.config.database)
+            continue;
+
+        auto *schemas = schemaItem(QStringLiteral("Schemas"),
+                                   QStringLiteral("schemas"),
+                                   QStringLiteral("boxes"));
+        database->appendRow(schemas);
+        for (const QString &schemaName : connection.snapshot.schemas) {
+            auto *schema = schemaItem(schemaName, QStringLiteral("schema"),
+                                      QStringLiteral("boxes"), schemaName,
+                                      schemaName);
+            schemas->appendRow(schema);
+            if (schemaName != QStringLiteral("public"))
+                continue;
+
+            auto *tables = schemaItem(QStringLiteral("Tables"),
+                                      QStringLiteral("tables"),
+                                      QStringLiteral("table-2"));
+            for (const QString &table : connection.snapshot.publicTables) {
+                tables->appendRow(schemaItem(
+                    table, QStringLiteral("Table"), QStringLiteral("table-2"),
+                    table, QStringLiteral("public")));
+            }
+            schema->appendRow(tables);
+
+            auto *views = schemaItem(QStringLiteral("Views"),
+                                     QStringLiteral("views"),
+                                     QStringLiteral("eye"));
+            for (const QString &view : connection.snapshot.publicViews) {
+                views->appendRow(schemaItem(
+                    view, QStringLiteral("View"), QStringLiteral("eye"),
+                    view, QStringLiteral("public")));
+            }
+            schema->appendRow(views);
+        }
+    }
+
+    applyCachedAppearance(usersItem);
+    applyCachedAppearance(databasesItem);
+    schemaTree_->expand(schemaProxy_->mapFromSource(root->index()));
+    schemaTree_->expand(schemaProxy_->mapFromSource(usersItem->index()));
+    schemaTree_->expand(schemaProxy_->mapFromSource(databasesItem->index()));
+}
+
+void MainWindow::updateConnectionSnapshot(
+    QStandardItem *users, QStandardItem *databases)
+{
+    SavedConnection *connection = savedConnection(activeConnectionId_);
+    // Session-only connections must not overwrite a saved profile's cached tree.
+    if (!connection
+        || connection->config.database != postgres_.config().database) {
+        return;
+    }
+
+    ConnectionSnapshot snapshot;
+    for (int row = 0; row < users->rowCount(); ++row)
+        snapshot.users.append(users->child(row)->data(NameRole).toString());
+    for (int row = 0; row < databases->rowCount(); ++row) {
+        QStandardItem *database = databases->child(row);
+        snapshot.databases.append(database->data(NameRole).toString());
+        if (database->data(NameRole).toString() != connection->config.database)
+            continue;
+        QStandardItem *schemas = database->child(0);
+        if (!schemas)
+            continue;
+        for (int schemaRow = 0; schemaRow < schemas->rowCount(); ++schemaRow) {
+            QStandardItem *schema = schemas->child(schemaRow);
+            const QString schemaName = schema->data(NameRole).toString();
+            snapshot.schemas.append(schemaName);
+            if (schemaName != QStringLiteral("public"))
+                continue;
+            for (int groupRow = 0; groupRow < schema->rowCount(); ++groupRow) {
+                QStandardItem *group = schema->child(groupRow);
+                QStringList *relations = nullptr;
+                const QString groupType = group->data(TypeRole).toString();
+                if (groupType == QStringLiteral("tables"))
+                    relations = &snapshot.publicTables;
+                else if (groupType == QStringLiteral("views"))
+                    relations = &snapshot.publicViews;
+                else
+                    continue;
+                for (int relationRow = 0; relationRow < group->rowCount();
+                     ++relationRow) {
+                    relations->append(
+                        group->child(relationRow)->data(NameRole).toString());
+                }
+            }
+        }
+    }
+
+    connection->snapshot = std::move(snapshot);
+    QSettings settings;
+    QString error;
+    if (!ConnectionStore::saveSnapshot(settings, *connection, &error))
+        statusBar()->showMessage(error, 5000);
 }
 
 void MainWindow::loadSchemaChildren(QStandardItem *item)
@@ -858,7 +1052,7 @@ void MainWindow::runQuery(QueryPage *page, bool editableTable)
         return;
     if (!postgres_.isConnected()) {
         page->setStatus(QStringLiteral("请先连接 PostgreSQL"));
-        showPostgresConnectionDialog();
+        connectSelectedConnection();
         return;
     }
     const QString sql = page->selectedSql().trimmed();
@@ -922,7 +1116,7 @@ void MainWindow::stopQuery()
 void MainWindow::refreshSchema()
 {
     if (!postgres_.isConnected()) {
-        showPostgresConnectionDialog();
+        connectSelectedConnection();
         return;
     }
     populateSchema();
@@ -951,6 +1145,14 @@ void MainWindow::handleSchemaSelection()
     const QString name = source.data(NameRole).toString();
     const QString type = source.data(TypeRole).toString();
     const QString schema = source.data(SchemaRole).toString();
+    const QString connectionId = connectionIdForIndex(source);
+    if (!connectionId.isEmpty()
+        && (!postgres_.isConnected() || connectionId != activeConnectionId_)) {
+        if (const SavedConnection *connection = savedConnection(connectionId)) {
+            updateInspector(*connection, false);
+            return;
+        }
+    }
     if ((type == QStringLiteral("Table") || type == QStringLiteral("View"))
         && postgres_.isConnected()) {
         QString error;
@@ -973,7 +1175,26 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
     const QString type = source.data(TypeRole).toString();
     const QString name = source.data(NameRole).toString();
     const QString schema = source.data(SchemaRole).toString();
+    const QString connectionId = connectionIdForIndex(source);
     QString error;
+
+    if (!connectionId.isEmpty()
+        && (!postgres_.isConnected() || connectionId != activeConnectionId_)) {
+        connectSavedConnection(
+            connectionId,
+            type == QStringLiteral("database") ? name : QString{});
+        return;
+    }
+
+    if (type == QStringLiteral("connection")) {
+        if (postgres_.isConnected()) {
+            schemaTree_->setExpanded(proxyIndex,
+                                     !schemaTree_->isExpanded(proxyIndex));
+        } else {
+            showPostgresConnectionDialog();
+        }
+        return;
+    }
 
     if (type == QStringLiteral("user")) {
         cancelRunningQuery();
@@ -1003,9 +1224,16 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
             showDatabaseError(QStringLiteral("切换数据库失败"), error);
             return;
         }
+        QString saveError;
+        const bool saved = persistActiveConnectionConfig(&saveError);
         updateConnectionUi();
         populateSchema();
-        statusBar()->showMessage(QStringLiteral("当前数据库已切换为 %1").arg(name), 5000);
+        statusBar()->showMessage(
+            saved
+                ? QStringLiteral("当前数据库已切换为 %1").arg(name)
+                : QStringLiteral("已切换到 %1，但无法保存为默认数据库：%2")
+                      .arg(name, saveError),
+            6000);
         return;
     }
 
@@ -1108,6 +1336,30 @@ void MainWindow::updateInspector(const QString &name, const QString &type,
     clearInspectorModels();
 }
 
+void MainWindow::updateInspector(const SavedConnection &connection, bool connected)
+{
+    const PostgresConnectionConfig &config =
+        connected ? postgres_.config() : connection.config;
+    objectIcon_->setPixmap(toolbarIcon(QStringLiteral("postgresql")).pixmap(QSize(20, 20)));
+    objectName_->setText(config.displayName());
+    objectType_->setText(connected ? QStringLiteral("PostgreSQL connection")
+                                   : QStringLiteral("Saved connection · Disconnected"));
+    objectPath_->setText(
+        QStringLiteral("%1:%2/%3")
+            .arg(config.host)
+            .arg(config.port)
+            .arg(config.database));
+    rowEstimate_->setText(QStringLiteral("—"));
+    size_->setText(QStringLiteral("—"));
+    description_->setText(
+        connected
+            ? QStringLiteral("当前用户：%1").arg(postgres_.currentUser())
+            : connection.hasStoredPassword
+                  ? QStringLiteral("双击左侧连接即可使用已保存凭据连接")
+                  : QStringLiteral("未找到已保存密码；双击后可重新输入"));
+    clearInspectorModels();
+}
+
 void MainWindow::updateInspector(const DatabaseTable &table)
 {
     objectIcon_->setPixmap(toolbarIcon(QStringLiteral("table-2")).pixmap(QSize(20, 20)));
@@ -1150,8 +1402,13 @@ void MainWindow::updateConnectionUi()
     reconnectAction_->setEnabled(connected);
     disconnectAction_->setEnabled(connected);
     if (!connected) {
-        connectionContext_->addItem(toolbarIcon(QStringLiteral("postgresql")),
-                                    QStringLiteral("PostgreSQL · 未连接"));
+        const SavedConnection *active = savedConnection(activeConnectionId_);
+        const QString label = active
+            ? QStringLiteral("%1 · 未连接").arg(active->config.displayName())
+            : savedConnections_.isEmpty()
+                  ? QStringLiteral("PostgreSQL · 未连接")
+                  : QStringLiteral("%1 个已保存连接").arg(savedConnections_.size());
+        connectionContext_->addItem(toolbarIcon(QStringLiteral("postgresql")), label);
         schemaContext_->addItem(toolbarIcon(QStringLiteral("boxes")), QStringLiteral("无活动数据库"));
         return;
     }
@@ -1164,29 +1421,296 @@ void MainWindow::updateConnectionUi()
                             QStringLiteral("public @ %1").arg(postgres_.config().database));
 }
 
+void MainWindow::refreshConnectionPresentation()
+{
+    updateConnectionUi();
+    populateSchema();
+    if (const SavedConnection *active = savedConnection(activeConnectionId_))
+        updateInspector(*active, postgres_.isConnected());
+    else
+        updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+}
+
 void MainWindow::showPostgresConnectionDialog()
 {
-    PostgresConnectionDialog dialog(this);
-    if (!postgres_.config().user.isEmpty())
-        dialog.setConfig(postgres_.config());
-    if (dialog.exec() != QDialog::Accepted)
+    editConnection(QString{});
+}
+
+void MainWindow::editSelectedConnection()
+{
+    editConnection(preferredConnectionId());
+}
+
+bool MainWindow::editConnection(
+    const QString &connectionId, const QString &notice,
+    const std::optional<PostgresConnectionConfig> &initialConfig)
+{
+    SavedConnection draft;
+    bool hasInitialConfig = false;
+    if (const SavedConnection *existing = savedConnection(connectionId)) {
+        draft = *existing;
+        hasInitialConfig = true;
+    }
+    if (initialConfig) {
+        draft.config = *initialConfig;
+        hasInitialConfig = true;
+    }
+
+    if (!notice.isEmpty())
+        QMessageBox::warning(this, QStringLiteral("需要更新连接信息"), notice);
+
+    PostgresConnectionConfig candidate = draft.config;
+    while (true) {
+        PostgresConnectionDialog dialog(this);
+        if (hasInitialConfig)
+            dialog.setConfig(candidate);
+        if (dialog.exec() != QDialog::Accepted)
+            return false;
+
+        candidate = dialog.config();
+        hasInitialConfig = true;
+        cancelRunningQuery();
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QString connectionError;
+        const bool connected = postgres_.connectToServer(candidate, &connectionError);
+        QApplication::restoreOverrideCursor();
+        if (!connected) {
+            QMessageBox::warning(
+                this, QStringLiteral("PostgreSQL 连接失败"),
+                QStringLiteral("%1\n\n请修改密码、连接地址、端口、用户或数据库后重试。")
+                    .arg(connectionError.isEmpty()
+                             ? QStringLiteral("未知数据库错误")
+                             : connectionError));
+            continue;
+        }
+
+        draft.config = candidate;
+        QSettings settings;
+        QString saveError;
+        const bool saved = ConnectionStore::upsert(
+            settings, *credentialStore_, draft, &saveError);
+        if (saved) {
+            if (SavedConnection *existing = savedConnection(draft.id))
+                *existing = draft;
+            else
+                savedConnections_.append(draft);
+            activeConnectionId_ = draft.id;
+        } else {
+            QMessageBox::warning(
+                this, QStringLiteral("连接已建立，但无法保存"),
+                QStringLiteral("%1\n\n本次会话仍可使用该连接，但下次启动时需要重新输入。")
+                    .arg(saveError));
+            if (!draft.id.isEmpty()) {
+                if (SavedConnection *existing = savedConnection(draft.id))
+                    *existing = draft;
+                activeConnectionId_ = draft.id;
+            } else {
+                activeConnectionId_.clear();
+            }
+        }
+
+        refreshConnectionPresentation();
+        statusBar()->showMessage(
+            saved
+                ? QStringLiteral("已连接并保存 %1").arg(postgres_.config().displayName())
+                : QStringLiteral("已连接 %1（未保存）").arg(postgres_.config().displayName()),
+            6000);
+        return true;
+    }
+}
+
+void MainWindow::connectSelectedConnection()
+{
+    const QString connectionId = preferredConnectionId();
+    if (connectionId.isEmpty()) {
+        showPostgresConnectionDialog();
         return;
+    }
+
+    const QModelIndex sourceIndex =
+        schemaProxy_->mapToSource(schemaTree_->currentIndex());
+    const QString database =
+        sourceIndex.data(TypeRole).toString() == QStringLiteral("database")
+        ? sourceIndex.data(NameRole).toString()
+        : QString{};
+    connectSavedConnection(connectionId, database);
+}
+
+void MainWindow::connectSavedConnection(
+    const QString &connectionId, const QString &database)
+{
+    const SavedConnection *stored = savedConnection(connectionId);
+    if (!stored)
+        return;
+    if (postgres_.isConnected() && connectionId == activeConnectionId_) {
+        statusBar()->showMessage(QStringLiteral("该数据库已经连接"), 3000);
+        return;
+    }
+
+    PostgresConnectionConfig config = stored->config;
+    if (!database.isEmpty())
+        config.database = database;
+    if (!stored->hasStoredPassword) {
+        editConnection(
+            connectionId,
+            QStringLiteral("没有找到此连接的已保存密码，请重新输入连接信息。"),
+            config);
+        return;
+    }
 
     cancelRunningQuery();
     QApplication::setOverrideCursor(Qt::WaitCursor);
     QString error;
-    const bool connected = postgres_.connectToServer(dialog.config(), &error);
+    const bool connected = postgres_.connectToServer(config, &error);
     QApplication::restoreOverrideCursor();
     if (!connected) {
-        showDatabaseError(QStringLiteral("PostgreSQL 连接失败"), error);
-        updateConnectionUi();
-        populateSchema();
+        editConnection(
+            connectionId,
+            QStringLiteral("使用已保存的账号和密码自动连接失败：\n%1\n\n"
+                           "请更新密码、连接地址、端口、用户或数据库。")
+                .arg(error.isEmpty() ? QStringLiteral("未知数据库错误") : error),
+            config);
         return;
     }
-    updateConnectionUi();
-    populateSchema();
-    updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
-    statusBar()->showMessage(QStringLiteral("已连接 %1").arg(postgres_.config().displayName()), 5000);
+
+    activeConnectionId_ = connectionId;
+    QString saveError;
+    const bool saved = persistActiveConnectionConfig(&saveError);
+    refreshConnectionPresentation();
+    statusBar()->showMessage(
+        saved
+            ? QStringLiteral("已使用保存的凭据连接 %1").arg(config.displayName())
+            : QStringLiteral("已连接 %1，但无法保存为默认数据库：%2")
+                  .arg(config.displayName(), saveError),
+        6000);
+}
+
+bool MainWindow::persistActiveConnectionConfig(QString *error)
+{
+    SavedConnection *connection = savedConnection(activeConnectionId_);
+    if (!connection) {
+        if (error)
+            *error = QStringLiteral("当前连接尚未保存。");
+        return false;
+    }
+    connection->config = postgres_.config();
+    QSettings settings;
+    return ConnectionStore::upsert(
+        settings, *credentialStore_, *connection, error);
+}
+
+void MainWindow::showConnectionContextMenu(const QPoint &position)
+{
+    const QModelIndex proxyIndex = schemaTree_->indexAt(position);
+    if (!proxyIndex.isValid())
+        return;
+    schemaTree_->setCurrentIndex(proxyIndex);
+    const QString connectionId = selectedConnectionId();
+    if (connectionId.isEmpty())
+        return;
+
+    QMenu menu(schemaTree_);
+    QAction *connectAction = menu.addAction(QStringLiteral("连接"));
+    connectAction->setEnabled(
+        !postgres_.isConnected() || connectionId != activeConnectionId_);
+    connect(connectAction, &QAction::triggered,
+            this, &MainWindow::connectSelectedConnection);
+    QAction *editAction = menu.addAction(QStringLiteral("编辑连接"));
+    connect(editAction, &QAction::triggered,
+            this, &MainWindow::editSelectedConnection);
+    menu.addSeparator();
+    QAction *removeAction = menu.addAction(QStringLiteral("删除已保存连接"));
+    connect(removeAction, &QAction::triggered,
+            this, &MainWindow::removeSelectedConnection);
+    menu.exec(schemaTree_->viewport()->mapToGlobal(position));
+}
+
+void MainWindow::removeSelectedConnection()
+{
+    const QString connectionId = selectedConnectionId();
+    SavedConnection *connection = savedConnection(connectionId);
+    if (!connection) {
+        statusBar()->showMessage(QStringLiteral("请先选择要删除的已保存连接"), 4000);
+        return;
+    }
+    const QString displayName = connection->config.displayName();
+    if (QMessageBox::question(
+            this, QStringLiteral("删除已保存连接"),
+            QStringLiteral("确定删除 %1？\n保存的密码也会从 Windows 凭据管理器中移除。")
+                .arg(displayName))
+        != QMessageBox::Yes) {
+        return;
+    }
+
+    QSettings settings;
+    QString error;
+    if (!ConnectionStore::remove(settings, *credentialStore_, connectionId, &error)) {
+        showDatabaseError(QStringLiteral("删除连接失败"), error);
+        return;
+    }
+    if (connectionId == activeConnectionId_) {
+        cancelRunningQuery();
+        postgres_.disconnect();
+        activeConnectionId_.clear();
+    }
+    for (qsizetype index = 0; index < savedConnections_.size(); ++index) {
+        if (savedConnections_.at(index).id == connectionId) {
+            savedConnections_.removeAt(index);
+            break;
+        }
+    }
+    refreshConnectionPresentation();
+    statusBar()->showMessage(QStringLiteral("已删除 %1").arg(displayName), 5000);
+}
+
+QString MainWindow::connectionIdForIndex(QModelIndex sourceIndex) const
+{
+    while (sourceIndex.isValid()) {
+        const QString connectionId =
+            sourceIndex.data(ConnectionIdRole).toString();
+        if (!connectionId.isEmpty())
+            return connectionId;
+        sourceIndex = sourceIndex.parent();
+    }
+    return {};
+}
+
+QString MainWindow::selectedConnectionId() const
+{
+    const QModelIndex proxyIndex = schemaTree_->currentIndex();
+    if (!proxyIndex.isValid())
+        return {};
+    return connectionIdForIndex(
+        schemaProxy_->mapToSource(proxyIndex));
+}
+
+QString MainWindow::preferredConnectionId() const
+{
+    const QString selected = selectedConnectionId();
+    if (!selected.isEmpty())
+        return selected;
+    if (!activeConnectionId_.isEmpty())
+        return activeConnectionId_;
+    return savedConnections_.isEmpty() ? QString{} : savedConnections_.constFirst().id;
+}
+
+SavedConnection *MainWindow::savedConnection(const QString &connectionId)
+{
+    for (SavedConnection &connection : savedConnections_) {
+        if (connection.id == connectionId)
+            return &connection;
+    }
+    return nullptr;
+}
+
+const SavedConnection *MainWindow::savedConnection(
+    const QString &connectionId) const
+{
+    for (const SavedConnection &connection : savedConnections_) {
+        if (connection.id == connectionId)
+            return &connection;
+    }
+    return nullptr;
 }
 
 void MainWindow::showDatabaseError(const QString &title, const QString &error)

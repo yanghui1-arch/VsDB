@@ -22,6 +22,8 @@ qt_add_executable(VsDB
     src/UiComponents.h
     src/WorkbenchModels.cpp
     src/WorkbenchModels.h
+    src/database/ConnectionStore.cpp
+    src/database/ConnectionStore.h
     src/database/DatabaseTypes.h
     src/database/postgres/PostgresQueryWorker.cpp
     src/database/postgres/PostgresQueryWorker.h
@@ -40,6 +42,9 @@ target_include_directories(VsDB PRIVATE src)
 configure_file(resources/theme.qss theme.qss COPYONLY)
 
 target_link_libraries(VsDB PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::Sql)
+if(WIN32)
+    target_link_libraries(VsDB PRIVATE advapi32)
+endif()
 add_custom_command(TARGET VsDB POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:Qt6::Svg> $<TARGET_FILE_DIR:VsDB>
@@ -112,4 +117,17 @@ if(BUILD_TESTING)
     target_include_directories(VsDBPostgresTests PRIVATE src)
     target_link_libraries(VsDBPostgresTests PRIVATE Qt6::Core Qt6::Sql)
     add_test(NAME VsDB.PostgresSession COMMAND VsDBPostgresTests)
+
+    add_executable(VsDBConnectionStoreTests
+        tests/ConnectionStoreTest.cpp
+        src/database/ConnectionStore.cpp
+        src/database/ConnectionStore.h
+        src/database/DatabaseTypes.h
+    )
+    target_include_directories(VsDBConnectionStoreTests PRIVATE src)
+    target_link_libraries(VsDBConnectionStoreTests PRIVATE Qt6::Core)
+    if(WIN32)
+        target_link_libraries(VsDBConnectionStoreTests PRIVATE advapi32)
+    endif()
+    add_test(NAME VsDB.ConnectionStore COMMAND VsDBConnectionStoreTests)
 endif()
