@@ -70,16 +70,28 @@ int main(int argc, char *argv[])
     if (connection.id.isEmpty() || !connection.hasStoredPassword)
         return fail(3, "saved connection identity or password state is invalid");
 
+    connection.snapshot.users = {QStringLiteral("analytics"),
+                                 QStringLiteral("reporter")};
+    connection.snapshot.databases = {QStringLiteral("warehouse"),
+                                     QStringLiteral("reporting")};
+    connection.snapshot.schemas = {QStringLiteral("public"),
+                                   QStringLiteral("information_schema")};
+    connection.snapshot.publicTables = {QStringLiteral("orders"),
+                                        QStringLiteral("customers")};
+    connection.snapshot.publicViews = {QStringLiteral("daily_revenue")};
+    if (!vsdb::ConnectionStore::saveSnapshot(settings, connection, &error))
+        return fail(4, "saving a connection snapshot failed");
+
     for (const QString &key : settings.allKeys()) {
         if (settings.value(key).toString() == connection.config.password)
-            return fail(4, "password leaked into QSettings");
+            return fail(5, "password leaked into QSettings");
     }
 
     QStringList warnings;
     const QVector<vsdb::SavedConnection> loaded =
         vsdb::ConnectionStore::load(settings, credentials, &warnings);
     if (!warnings.isEmpty() || loaded.size() != 1)
-        return fail(5, "saved connection did not load cleanly");
+        return fail(6, "saved connection did not load cleanly");
     const vsdb::SavedConnection &restored = loaded.constFirst();
     if (restored.id != connection.id
         || restored.config.host != connection.config.host
@@ -90,23 +102,30 @@ int main(int argc, char *argv[])
         || restored.config.sslMode != connection.config.sslMode
         || restored.config.connectTimeoutSeconds
             != connection.config.connectTimeoutSeconds
+        || restored.snapshot.users != connection.snapshot.users
+        || restored.snapshot.databases != connection.snapshot.databases
+        || restored.snapshot.schemas != connection.snapshot.schemas
+        || restored.snapshot.publicTables != connection.snapshot.publicTables
+        || restored.snapshot.publicViews != connection.snapshot.publicViews
         || !restored.hasStoredPassword) {
-        return fail(6, "saved connection fields were not restored");
+        return fail(7, "saved connection fields were not restored");
     }
 
     connection.config.password = QStringLiteral("replacement password");
     connection.config.port = 6432;
     if (!vsdb::ConnectionStore::upsert(settings, credentials, connection, &error))
-        return fail(7, "updating a connection failed");
+        return fail(8, "updating a connection failed");
     if (settings.value(QStringLiteral("connections/order")).toStringList().size() != 1)
-        return fail(8, "updating duplicated the connection");
+        return fail(9, "updating duplicated the connection");
 
     const QVector<vsdb::SavedConnection> updated =
         vsdb::ConnectionStore::load(settings, credentials);
     if (updated.size() != 1
         || updated.constFirst().config.password != connection.config.password
-        || updated.constFirst().config.port != 6432) {
-        return fail(9, "updated connection was not restored");
+        || updated.constFirst().config.port != 6432
+        || updated.constFirst().snapshot.publicTables
+            != connection.snapshot.publicTables) {
+        return fail(10, "updated connection was not restored");
     }
 
     MemoryCredentialStore missingCredentials;
@@ -116,7 +135,7 @@ int main(int argc, char *argv[])
     if (missingPassword.size() != 1
         || missingPassword.constFirst().hasStoredPassword
         || warnings.size() != 1) {
-        return fail(10, "a connection with a missing password should remain visible");
+        return fail(11, "a connection with a missing password should remain visible");
     }
 
     vsdb::SavedConnection secondConnection;
@@ -126,32 +145,32 @@ int main(int argc, char *argv[])
     secondConnection.config.database = QStringLiteral("reporting");
     if (!vsdb::ConnectionStore::upsert(
             settings, credentials, secondConnection, &error)) {
-        return fail(11, "saving a second connection failed");
+        return fail(12, "saving a second connection failed");
     }
     const QVector<vsdb::SavedConnection> multipleConnections =
         vsdb::ConnectionStore::load(settings, credentials);
     if (multipleConnections.size() != 2
         || multipleConnections.at(0).id != connection.id
         || multipleConnections.at(1).id != secondConnection.id) {
-        return fail(12, "multiple connections were not restored in saved order");
+        return fail(13, "multiple connections were not restored in saved order");
     }
 
     if (!vsdb::ConnectionStore::remove(
             settings, credentials, connection.id, &error)) {
-        return fail(13, "removing a connection failed");
+        return fail(14, "removing a connection failed");
     }
     const QVector<vsdb::SavedConnection> remaining =
         vsdb::ConnectionStore::load(settings, credentials);
     if (remaining.size() != 1 || remaining.constFirst().id != secondConnection.id) {
-        return fail(14, "removing one connection affected another connection");
+        return fail(15, "removing one connection affected another connection");
     }
     if (!vsdb::ConnectionStore::remove(
             settings, credentials, secondConnection.id, &error)) {
-        return fail(15, "removing the second connection failed");
+        return fail(16, "removing the second connection failed");
     }
     if (!vsdb::ConnectionStore::load(settings, credentials).isEmpty()
         || !credentials.secrets.isEmpty()) {
-        return fail(16, "connection metadata or password remained after removal");
+        return fail(17, "connection metadata or password remained after removal");
     }
 
     return 0;

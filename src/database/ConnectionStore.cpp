@@ -171,6 +171,16 @@ QVector<SavedConnection> ConnectionStore::load(
             settings.value(QStringLiteral("sslMode"), QStringLiteral("prefer")).toString();
         connection.config.connectTimeoutSeconds =
             settings.value(QStringLiteral("connectTimeout"), 10).toInt();
+        connection.snapshot.users =
+            settings.value(QStringLiteral("snapshot/users")).toStringList();
+        connection.snapshot.databases =
+            settings.value(QStringLiteral("snapshot/databases")).toStringList();
+        connection.snapshot.schemas =
+            settings.value(QStringLiteral("snapshot/schemas")).toStringList();
+        connection.snapshot.publicTables =
+            settings.value(QStringLiteral("snapshot/publicTables")).toStringList();
+        connection.snapshot.publicViews =
+            settings.value(QStringLiteral("snapshot/publicViews")).toStringList();
         settings.endGroup();
 
         if (driver != QStringLiteral("QPSQL") || connection.config.host.isEmpty()
@@ -249,6 +259,27 @@ bool ConnectionStore::upsert(QSettings &settings, CredentialStore &credentials,
 
     connection.hasStoredPassword = true;
     return true;
+}
+
+bool ConnectionStore::saveSnapshot(QSettings &settings,
+                                   const SavedConnection &connection,
+                                   QString *error)
+{
+    settings.beginGroup(profileGroup(connection.id));
+    settings.setValue(QStringLiteral("snapshot/users"), connection.snapshot.users);
+    settings.setValue(QStringLiteral("snapshot/databases"),
+                      connection.snapshot.databases);
+    settings.setValue(QStringLiteral("snapshot/schemas"), connection.snapshot.schemas);
+    settings.setValue(QStringLiteral("snapshot/publicTables"),
+                      connection.snapshot.publicTables);
+    settings.setValue(QStringLiteral("snapshot/publicViews"),
+                      connection.snapshot.publicViews);
+    settings.endGroup();
+    settings.sync();
+    if (settings.status() == QSettings::NoError)
+        return true;
+    assignError(error, QStringLiteral("数据库结构快照无法写入本地设置。"));
+    return false;
 }
 
 bool ConnectionStore::remove(QSettings &settings, CredentialStore &credentials,

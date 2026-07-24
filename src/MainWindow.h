@@ -12,6 +12,7 @@ class QAction;
 class QComboBox;
 class QLabel;
 class QModelIndex;
+class QPoint;
 class QSortFilterProxyModel;
 class QSplitter;
 class QStandardItem;
@@ -43,6 +44,10 @@ private:
     void createDatabaseToolBar();
     void populateSchema();
     void populateActiveConnection(QStandardItem *root);
+    void populateCachedConnection(QStandardItem *root,
+                                  const SavedConnection &connection);
+    void updateConnectionSnapshot(QStandardItem *users,
+                                  QStandardItem *databases);
     void loadSchemaChildren(QStandardItem *item);
     void installActions();
     void updateInspector(const QString &name, const QString &type,
@@ -63,6 +68,8 @@ private:
     void connectSelectedConnection();
     void connectSavedConnection(const QString &connectionId);
     void removeSelectedConnection();
+    void showConnectionContextMenu(const QPoint &position);
+    QString connectionIdForIndex(QModelIndex sourceIndex) const;
     QString selectedConnectionId() const;
     QString preferredConnectionId() const;
     SavedConnection *savedConnection(const QString &connectionId);

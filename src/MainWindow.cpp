@@ -96,6 +96,17 @@ QStandardItem *schemaItem(const QString &text, const QString &type,
     return item;
 }
 
+void applyCachedAppearance(QStandardItem *item)
+{
+    item->setForeground(QColor(QStringLiteral("#686C77")));
+    if (!item->icon().isNull()) {
+        item->setIcon(QIcon(item->icon().pixmap(
+            QSize(16, 16), QIcon::Disabled, QIcon::Off)));
+    }
+    for (int row = 0; row < item->rowCount(); ++row)
+        applyCachedAppearance(item->child(row));
+}
+
 void appendReadOnlyRow(QStandardItemModel *model, const QStringList &cells,
                        const QString &icon = {})
 {
@@ -467,27 +478,14 @@ QWidget *MainWindow::createExplorer()
     schemaTree_->setAnimated(false);
     schemaTree_->setIconSize(QSize(16, 16));
     schemaTree_->setIndentation(18);
+    schemaTree_->setContextMenuPolicy(Qt::CustomContextMenu);
     layout->addWidget(schemaTree_, 1);
-
-    auto *footer = new QWidget(pane);
-    footer->setFixedHeight(43);
-    auto *footerLayout = new QHBoxLayout(footer);
-    footerLayout->setContentsMargins(9, 3, 9, 3);
-    QToolButton *add = plainButton(footer, QStringLiteral("＋"), QStringLiteral("添加 PostgreSQL 连接"));
-    QToolButton *refresh = plainButton(footer, QStringLiteral("↻"), QStringLiteral("刷新数据库结构"));
-    QToolButton *remove = plainButton(footer, QStringLiteral("⌫"), QStringLiteral("删除选中的已保存连接"));
-    footerLayout->addWidget(add);
-    footerLayout->addWidget(refresh);
-    footerLayout->addWidget(remove);
-    footerLayout->addStretch();
-    layout->addWidget(footer);
-    connect(add, &QToolButton::clicked, this, &MainWindow::showPostgresConnectionDialog);
-    connect(refresh, &QToolButton::clicked, this, &MainWindow::refreshSchema);
-    connect(remove, &QToolButton::clicked, this, &MainWindow::removeSelectedConnection);
 
     connect(schemaTree_->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &MainWindow::handleSchemaSelection);
     connect(schemaTree_, &QTreeView::doubleClicked, this, &MainWindow::activateSchemaItem);
+    connect(schemaTree_, &QTreeView::customContextMenuRequested,
+            this, &MainWindow::showConnectionContextMenu);
     connect(schemaTree_, &QTreeView::expanded, this, [this](const QModelIndex &proxyIndex) {
         const QModelIndex sourceIndex = schemaProxy_->mapToSource(proxyIndex);
         loadSchemaChildren(schemaModel_->itemFromIndex(sourceIndex));
@@ -652,7 +650,8 @@ void MainWindow::populateSchema()
         const QString text = active
             ? QStringLiteral("PostgreSQL · %1（已连接）")
                   .arg(displayConfig.displayName())
-            : QStringLiteral("%1（双击连接）").arg(displayConfig.displayName());
+            : QStringLiteral("PostgreSQL · %1（未连接）")
+                  .arg(displayConfig.displayName());
         auto *root = schemaItem(text, QStringLiteral("connection"),
                                 QStringLiteral("postgresql"),
                                 displayConfig.displayName());
@@ -665,8 +664,10 @@ void MainWindow::populateSchema()
             selectedRoot = root;
         if (connection.id == activeConnectionId_)
             selectedRoot = root;
-        if (!active)
+        if (!active) {
+            populateCachedConnection(root, connection);
             continue;
+        }
 
         activeRoot = root;
         selectedRoot = root;
@@ -690,8 +691,12 @@ void MainWindow::populateSchema()
         schemaModel_->appendRow(selectedRoot);
     }
 
-    schemaTree_->setCurrentIndex(
-        schemaProxy_->mapFromSource(selectedRoot->index()));
+    if (postgres_.isConnected()) {
+        schemaTree_->setCurrentIndex(
+            schemaProxy_->mapFromSource(selectedRoot->index()));
+    } else {
+        schemaTree_->setCurrentIndex(QModelIndex{});
+    }
 }
 
 void MainWindow::populateActiveConnection(QStandardItem *root)
@@ -715,7 +720,7 @@ void MainWindow::populateActiveConnection(QStandardItem *root)
         schemaTree_->expand(schemaProxy_->mapFromSource(database->index()));
         QStandardItem *schemas = database->child(0);
         if (!schemas)
-            return;
+            break;
         loadSchemaChildren(schemas);
         schemaTree_->expand(schemaProxy_->mapFromSource(schemas->index()));
         for (int schemaRow = 0; schemaRow < schemas->rowCount(); ++schemaRow) {
@@ -729,10 +734,151 @@ void MainWindow::populateActiveConnection(QStandardItem *root)
                 schemaTree_->expand(schemaProxy_->mapFromSource(
                     schema->child(relationGroup)->index()));
             }
-            return;
+            break;
         }
+        break;
+    }
+    updateConnectionSnapshot(users, databases);
+}
+
+void MainWindow::populateCachedConnection(
+    QStandardItem *root, const SavedConnection &connection)
+{
+    QStringList users = connection.snapshot.users;
+    if (!users.contains(connection.config.user))
+        users.prepend(connection.config.user);
+    QStringList databases = connection.snapshot.databases;
+    if (!databases.contains(connection.config.database))
+        databases.prepend(connection.config.database);
+
+    auto *usersItem = schemaItem(QStringLiteral("Users"), QStringLiteral("users"),
+                                 QStringLiteral("key-round"));
+    for (const QString &user : users) {
+        usersItem->appendRow(schemaItem(user, QStringLiteral("user"),
+                                        QStringLiteral("key-round"), user));
+    }
+    root->appendRow(usersItem);
+
+    auto *databasesItem = schemaItem(QStringLiteral("Databases"),
+                                     QStringLiteral("databases"),
+                                     QStringLiteral("database"));
+    root->appendRow(databasesItem);
+    for (const QString &databaseName : databases) {
+        auto *database = schemaItem(databaseName, QStringLiteral("database"),
+                                    QStringLiteral("database"), databaseName);
+        databasesItem->appendRow(database);
+        if (databaseName != connection.config.database)
+            continue;
+
+        auto *schemas = schemaItem(QStringLiteral("Schemas"),
+                                   QStringLiteral("schemas"),
+                                   QStringLiteral("boxes"));
+        database->appendRow(schemas);
+        for (const QString &schemaName : connection.snapshot.schemas) {
+            auto *schema = schemaItem(schemaName, QStringLiteral("schema"),
+                                      QStringLiteral("boxes"), schemaName,
+                                      schemaName);
+            schemas->appendRow(schema);
+            if (schemaName != QStringLiteral("public"))
+                continue;
+
+            auto *tables = schemaItem(QStringLiteral("Tables"),
+                                      QStringLiteral("tables"),
+                                      QStringLiteral("table-2"));
+            for (const QString &table : connection.snapshot.publicTables) {
+                tables->appendRow(schemaItem(
+                    table, QStringLiteral("Table"), QStringLiteral("table-2"),
+                    table, QStringLiteral("public")));
+            }
+            schema->appendRow(tables);
+
+            auto *views = schemaItem(QStringLiteral("Views"),
+                                     QStringLiteral("views"),
+                                     QStringLiteral("eye"));
+            for (const QString &view : connection.snapshot.publicViews) {
+                views->appendRow(schemaItem(
+                    view, QStringLiteral("View"), QStringLiteral("eye"),
+                    view, QStringLiteral("public")));
+            }
+            schema->appendRow(views);
+        }
+    }
+
+    applyCachedAppearance(root);
+    schemaTree_->expand(schemaProxy_->mapFromSource(root->index()));
+    schemaTree_->expand(schemaProxy_->mapFromSource(usersItem->index()));
+    schemaTree_->expand(schemaProxy_->mapFromSource(databasesItem->index()));
+
+    for (int row = 0; row < databasesItem->rowCount(); ++row) {
+        QStandardItem *database = databasesItem->child(row);
+        if (database->data(NameRole).toString() != connection.config.database)
+            continue;
+        schemaTree_->expand(schemaProxy_->mapFromSource(database->index()));
+        QStandardItem *schemas = database->child(0);
+        if (!schemas)
+            break;
+        schemaTree_->expand(schemaProxy_->mapFromSource(schemas->index()));
+        for (int schemaRow = 0; schemaRow < schemas->rowCount(); ++schemaRow) {
+            QStandardItem *schema = schemas->child(schemaRow);
+            if (schema->data(NameRole).toString() != QStringLiteral("public"))
+                continue;
+            schemaTree_->expand(schemaProxy_->mapFromSource(schema->index()));
+            break;
+        }
+        break;
+    }
+}
+
+void MainWindow::updateConnectionSnapshot(
+    QStandardItem *users, QStandardItem *databases)
+{
+    SavedConnection *connection = savedConnection(activeConnectionId_);
+    if (!connection
+        || connection->config.database != postgres_.config().database) {
         return;
     }
+
+    ConnectionSnapshot snapshot;
+    for (int row = 0; row < users->rowCount(); ++row)
+        snapshot.users.append(users->child(row)->data(NameRole).toString());
+    for (int row = 0; row < databases->rowCount(); ++row) {
+        QStandardItem *database = databases->child(row);
+        snapshot.databases.append(database->data(NameRole).toString());
+        if (database->data(NameRole).toString() != connection->config.database)
+            continue;
+        QStandardItem *schemas = database->child(0);
+        if (!schemas)
+            continue;
+        for (int schemaRow = 0; schemaRow < schemas->rowCount(); ++schemaRow) {
+            QStandardItem *schema = schemas->child(schemaRow);
+            const QString schemaName = schema->data(NameRole).toString();
+            snapshot.schemas.append(schemaName);
+            if (schemaName != QStringLiteral("public"))
+                continue;
+            for (int groupRow = 0; groupRow < schema->rowCount(); ++groupRow) {
+                QStandardItem *group = schema->child(groupRow);
+                QStringList *relations = nullptr;
+                const QString groupType = group->data(TypeRole).toString();
+                if (groupType == QStringLiteral("tables"))
+                    relations = &snapshot.publicTables;
+                else if (groupType == QStringLiteral("views"))
+                    relations = &snapshot.publicViews;
+                else
+                    continue;
+                for (int relationRow = 0; relationRow < group->rowCount();
+                     ++relationRow) {
+                    relations->append(
+                        group->child(relationRow)->data(NameRole).toString());
+                }
+            }
+        }
+    }
+
+    connection->snapshot = std::move(snapshot);
+    QSettings settings;
+    QString error;
+    if (!ConnectionStore::saveSnapshot(settings, *connection, &error))
+        statusBar()->showMessage(error, 5000);
 }
 
 void MainWindow::loadSchemaChildren(QStandardItem *item)
@@ -1016,11 +1162,11 @@ void MainWindow::handleSchemaSelection()
     const QString name = source.data(NameRole).toString();
     const QString type = source.data(TypeRole).toString();
     const QString schema = source.data(SchemaRole).toString();
-    const QString connectionId = source.data(ConnectionIdRole).toString();
-    if (type == QStringLiteral("connection") && !connectionId.isEmpty()) {
+    const QString connectionId = connectionIdForIndex(source);
+    if (!connectionId.isEmpty()
+        && (!postgres_.isConnected() || connectionId != activeConnectionId_)) {
         if (const SavedConnection *connection = savedConnection(connectionId)) {
-            updateInspector(*connection, postgres_.isConnected()
-                                             && connectionId == activeConnectionId_);
+            updateInspector(*connection, false);
             return;
         }
     }
@@ -1046,18 +1192,21 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
     const QString type = source.data(TypeRole).toString();
     const QString name = source.data(NameRole).toString();
     const QString schema = source.data(SchemaRole).toString();
-    const QString connectionId = source.data(ConnectionIdRole).toString();
+    const QString connectionId = connectionIdForIndex(source);
     QString error;
 
+    if (!connectionId.isEmpty()
+        && (!postgres_.isConnected() || connectionId != activeConnectionId_)) {
+        connectSavedConnection(connectionId);
+        return;
+    }
+
     if (type == QStringLiteral("connection")) {
-        if (connectionId.isEmpty()) {
-            showPostgresConnectionDialog();
-        } else if (postgres_.isConnected()
-                   && connectionId == activeConnectionId_) {
+        if (postgres_.isConnected()) {
             schemaTree_->setExpanded(proxyIndex,
                                      !schemaTree_->isExpanded(proxyIndex));
         } else {
-            connectSavedConnection(connectionId);
+            showPostgresConnectionDialog();
         }
         return;
     }
@@ -1419,6 +1568,32 @@ void MainWindow::connectSavedConnection(const QString &connectionId)
         QStringLiteral("已使用保存的凭据连接 %1").arg(config.displayName()), 5000);
 }
 
+void MainWindow::showConnectionContextMenu(const QPoint &position)
+{
+    const QModelIndex proxyIndex = schemaTree_->indexAt(position);
+    if (!proxyIndex.isValid())
+        return;
+    schemaTree_->setCurrentIndex(proxyIndex);
+    const QString connectionId = selectedConnectionId();
+    if (connectionId.isEmpty())
+        return;
+
+    QMenu menu(schemaTree_);
+    QAction *connectAction = menu.addAction(QStringLiteral("连接"));
+    connectAction->setEnabled(
+        !postgres_.isConnected() || connectionId != activeConnectionId_);
+    connect(connectAction, &QAction::triggered, this,
+            [this, connectionId] { connectSavedConnection(connectionId); });
+    QAction *editAction = menu.addAction(QStringLiteral("编辑连接"));
+    connect(editAction, &QAction::triggered, this,
+            [this, connectionId] { editConnection(connectionId); });
+    menu.addSeparator();
+    QAction *removeAction = menu.addAction(QStringLiteral("删除已保存连接"));
+    connect(removeAction, &QAction::triggered,
+            this, &MainWindow::removeSelectedConnection);
+    menu.exec(schemaTree_->viewport()->mapToGlobal(position));
+}
+
 void MainWindow::removeSelectedConnection()
 {
     const QString connectionId = selectedConnectionId();
@@ -1457,18 +1632,24 @@ void MainWindow::removeSelectedConnection()
     statusBar()->showMessage(QStringLiteral("已删除 %1").arg(displayName), 5000);
 }
 
+QString MainWindow::connectionIdForIndex(QModelIndex sourceIndex) const
+{
+    while (sourceIndex.isValid()) {
+        const QString connectionId =
+            sourceIndex.data(ConnectionIdRole).toString();
+        if (!connectionId.isEmpty())
+            return connectionId;
+        sourceIndex = sourceIndex.parent();
+    }
+    return {};
+}
+
 QString MainWindow::selectedConnectionId() const
 {
     if (!schemaTree_ || !schemaTree_->currentIndex().isValid())
         return {};
-    QModelIndex source = schemaProxy_->mapToSource(schemaTree_->currentIndex());
-    while (source.isValid()) {
-        const QString connectionId = source.data(ConnectionIdRole).toString();
-        if (!connectionId.isEmpty())
-            return connectionId;
-        source = source.parent();
-    }
-    return {};
+    return connectionIdForIndex(
+        schemaProxy_->mapToSource(schemaTree_->currentIndex()));
 }
 
 QString MainWindow::preferredConnectionId() const

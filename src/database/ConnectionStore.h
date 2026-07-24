@@ -12,10 +12,20 @@ class QSettings;
 
 namespace vsdb {
 
+struct ConnectionSnapshot
+{
+    QStringList users;
+    QStringList databases;
+    QStringList schemas;
+    QStringList publicTables;
+    QStringList publicViews;
+};
+
 struct SavedConnection
 {
     QString id;
     PostgresConnectionConfig config;
+    ConnectionSnapshot snapshot;
     bool hasStoredPassword = false;
 };
 
@@ -39,6 +49,8 @@ public:
                                          QStringList *warnings = nullptr);
     static bool upsert(QSettings &settings, CredentialStore &credentials,
                        SavedConnection &connection, QString *error = nullptr);
+    static bool saveSnapshot(QSettings &settings, const SavedConnection &connection,
+                             QString *error = nullptr);
     static bool remove(QSettings &settings, CredentialStore &credentials,
                        const QString &connectionId, QString *error = nullptr);
 
