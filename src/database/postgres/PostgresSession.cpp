@@ -59,16 +59,15 @@ QString queryError(const QSqlQuery &query)
 } // namespace
 
 PostgresSession::PostgresSession()
-    : connectionName_(QStringLiteral("vsdb-postgres-%1")
-                          .arg(QUuid::createUuid().toString(QUuid::WithoutBraces)))
+    : connectionPrefix_(QStringLiteral("vsdb-postgres-%1")
+                            .arg(QUuid::createUuid().toString(
+                                QUuid::WithoutBraces)))
 {
 }
 
 PostgresSession::~PostgresSession()
 {
     disconnect();
-    if (QSqlDatabase::contains(connectionName_))
-        QSqlDatabase::removeDatabase(connectionName_);
 }
 
 bool PostgresSession::connectToServer(const PostgresConnectionConfig &config,
@@ -81,33 +80,28 @@ bool PostgresSession::connectToServer(const PostgresConnectionConfig &config,
         return false;
     }
 
-    if (!QSqlDatabase::contains(connectionName_))
-        QSqlDatabase::addDatabase(QStringLiteral("QPSQL"), connectionName_);
-
-    const bool previousConnected = isConnected();
-    const PostgresConnectionConfig previousConfig = config_;
-    const QString previousUser = currentUser_;
-    const bool previousConfigured = configured_;
-    config_ = config;
-    configured_ = true;
-    currentUser_ = config.user;
-    if (openDatabase(config.database, error))
-        return true;
-
-    const QString connectionFailure = error ? *error : QString{};
-    if (previousConnected) {
-        config_ = previousConfig;
-        currentUser_ = previousUser;
-        configured_ = previousConfigured;
-        QString restoreError;
-        if (!openDatabase(previousConfig.database, &restoreError)) {
-            assignError(error, connectionFailure
-                + QStringLiteral("\n恢复原连接也失败：%1").arg(restoreError));
+    if (hasSameServerIdentity(config)) {
+        if (!activateDatabase(config.database, config.user, error))
             return false;
-        }
+        config_.connectTimeoutSeconds = config.connectTimeoutSeconds;
+        config_.database = config.database;
+        return true;
     }
-    assignError(error, connectionFailure);
-    return false;
+
+    QString connectionName;
+    if (!openDatabaseConnection(config, config.database, config.user,
+                                &connectionName, error)) {
+        return false;
+    }
+
+    disconnect();
+    config_ = config;
+    currentUser_ = config.user;
+    configured_ = true;
+    activeConnectionName_ = connectionName;
+    databaseConnections_.insert(config.database, connectionName);
+    databaseUsers_.insert(config.database, config.user);
+    return true;
 }
 
 bool PostgresSession::reconnect(QString *error)
@@ -117,23 +111,72 @@ bool PostgresSession::reconnect(QString *error)
         assignError(error, QStringLiteral("尚未配置 PostgreSQL 连接。"));
         return false;
     }
-    return openDatabase(config_.database, error);
+    return reopenActiveDatabase(error);
 }
 
 void PostgresSession::disconnect()
 {
-    if (!QSqlDatabase::contains(connectionName_))
-        return;
-    {
-        QSqlDatabase database = QSqlDatabase::database(connectionName_, false);
-        database.close();
+    const QStringList connectionNames = databaseConnections_.values();
+    databaseConnections_.clear();
+    databaseUsers_.clear();
+    activeConnectionName_.clear();
+    for (const QString &connectionName : connectionNames)
+        closeAndRemoveConnection(connectionName);
+}
+
+bool PostgresSession::disconnectDatabase(const QString &database)
+{
+    const QString connectionName = databaseConnections_.take(database);
+    if (connectionName.isEmpty())
+        return false;
+    databaseUsers_.remove(database);
+    closeAndRemoveConnection(connectionName);
+
+    if (activeConnectionName_ == connectionName) {
+        activeConnectionName_.clear();
+        const QStringList remaining = connectedDatabases();
+        if (!remaining.isEmpty()) {
+            const QString nextDatabase = remaining.constFirst();
+            activeConnectionName_ =
+                databaseConnections_.value(nextDatabase);
+            config_.database = nextDatabase;
+            currentUser_ =
+                databaseUsers_.value(nextDatabase, config_.user);
+        } else {
+            currentUser_ = config_.user;
+        }
     }
+    return true;
 }
 
 bool PostgresSession::isConnected() const
 {
-    return QSqlDatabase::contains(connectionName_)
-        && QSqlDatabase::database(connectionName_, false).isOpen();
+    return !activeConnectionName_.isEmpty()
+        && QSqlDatabase::contains(activeConnectionName_)
+        && QSqlDatabase::database(activeConnectionName_, false).isOpen();
+}
+
+bool PostgresSession::isDatabaseConnected(const QString &database) const
+{
+    const QString connectionName =
+        databaseConnections_.value(database);
+    return !connectionName.isEmpty()
+        && QSqlDatabase::contains(connectionName)
+        && QSqlDatabase::database(connectionName, false).isOpen();
+}
+
+QStringList PostgresSession::connectedDatabases() const
+{
+    QStringList databases;
+    for (auto iterator = databaseConnections_.constBegin();
+         iterator != databaseConnections_.constEnd(); ++iterator) {
+        if (QSqlDatabase::contains(iterator.value())
+            && QSqlDatabase::database(iterator.value(), false).isOpen()) {
+            databases.append(iterator.key());
+        }
+    }
+    databases.sort(Qt::CaseInsensitive);
+    return databases;
 }
 
 const PostgresConnectionConfig &PostgresSession::config() const
@@ -150,39 +193,151 @@ QString PostgresSession::serverVersion() const
 {
     if (!isConnected())
         return {};
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     query.setForwardOnly(true);
     if (!query.exec(QStringLiteral("SELECT current_setting('server_version')")) || !query.next())
         return {};
     return query.value(0).toString();
 }
 
-bool PostgresSession::openDatabase(const QString &databaseName, QString *error)
+bool PostgresSession::activateDatabase(const QString &databaseName,
+                                       const QString &sessionUser,
+                                       QString *error)
 {
-    QSqlDatabase database = QSqlDatabase::database(connectionName_, false);
-    database.close();
-    database.setHostName(config_.host);
-    database.setPort(config_.port);
+    const QString cachedConnection =
+        databaseConnections_.value(databaseName);
+    if (!cachedConnection.isEmpty()
+        && QSqlDatabase::contains(cachedConnection)
+        && QSqlDatabase::database(cachedConnection, false).isOpen()) {
+        activeConnectionName_ = cachedConnection;
+        config_.database = databaseName;
+        currentUser_ =
+            databaseUsers_.value(databaseName, config_.user);
+        return true;
+    }
+
+    if (!cachedConnection.isEmpty()) {
+        databaseConnections_.remove(databaseName);
+        databaseUsers_.remove(databaseName);
+        closeAndRemoveConnection(cachedConnection);
+    }
+
+    PostgresConnectionConfig targetConfig = config_;
+    targetConfig.database = databaseName;
+    QString connectionName;
+    if (!openDatabaseConnection(targetConfig, databaseName, sessionUser,
+                                &connectionName, error)) {
+        return false;
+    }
+    activeConnectionName_ = connectionName;
+    databaseConnections_.insert(databaseName, connectionName);
+    databaseUsers_.insert(databaseName, sessionUser);
+    config_.database = databaseName;
+    currentUser_ = sessionUser;
+    return true;
+}
+
+bool PostgresSession::openDatabaseConnection(
+    const PostgresConnectionConfig &config, const QString &databaseName,
+    const QString &sessionUser, QString *connectionName, QString *error)
+{
+    const QString candidateName =
+        QStringLiteral("%1-%2")
+            .arg(connectionPrefix_,
+                 QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database =
+        QSqlDatabase::addDatabase(QStringLiteral("QPSQL"), candidateName);
+    database.setHostName(config.host);
+    database.setPort(config.port);
     database.setDatabaseName(databaseName);
-    database.setUserName(config_.user);
+    database.setUserName(config.user);
     database.setConnectOptions(
         QStringLiteral("connect_timeout=%1;sslmode=%2;application_name=VsDB")
-            .arg(qBound(1, config_.connectTimeoutSeconds, 60))
-            .arg(config_.sslMode));
+            .arg(qBound(1, config.connectTimeoutSeconds, 60))
+            .arg(config.sslMode));
 
-    if (!database.open(config_.user, config_.password)) {
-        assignError(error, databaseError());
+    if (!database.open(config.user, config.password)) {
+        const QSqlError sqlError = database.lastError();
+        const QString databaseText = sqlError.databaseText().trimmed();
+        assignError(error, databaseText.isEmpty()
+                               ? sqlError.text().trimmed()
+                               : databaseText);
+        database = QSqlDatabase{};
+        QSqlDatabase::removeDatabase(candidateName);
         return false;
     }
 
-    config_.database = databaseName;
-    const QString requestedUser = currentUser_.isEmpty() ? config_.user : currentUser_;
-    currentUser_ = config_.user;
-    if (requestedUser != config_.user && !setSessionUser(requestedUser, error)) {
-        database.close();
-        return false;
+    if (sessionUser != config.user) {
+        QString authorizationError;
+        {
+            QSqlQuery query(database);
+            const QString escapedUser =
+                database.driver()->escapeIdentifier(
+                    sessionUser, QSqlDriver::FieldName);
+            if (!query.exec(
+                    QStringLiteral("SET SESSION AUTHORIZATION %1")
+                        .arg(escapedUser))) {
+                authorizationError = queryError(query);
+            }
+        }
+        if (!authorizationError.isEmpty()) {
+            assignError(error, authorizationError);
+            database.close();
+            database = QSqlDatabase{};
+            QSqlDatabase::removeDatabase(candidateName);
+            return false;
+        }
     }
+
+    if (connectionName)
+        *connectionName = candidateName;
     return true;
+}
+
+bool PostgresSession::reopenActiveDatabase(QString *error)
+{
+    const QString databaseName = config_.database;
+    const QString sessionUser = currentUser_;
+    QString newConnection;
+    if (!openDatabaseConnection(config_, databaseName, sessionUser,
+                                &newConnection, error)) {
+        return false;
+    }
+    const QString oldConnection =
+        databaseConnections_.value(databaseName);
+    databaseConnections_.insert(databaseName, newConnection);
+    databaseUsers_.insert(databaseName, sessionUser);
+    activeConnectionName_ = newConnection;
+    closeAndRemoveConnection(oldConnection);
+    return true;
+}
+
+void PostgresSession::closeAndRemoveConnection(
+    const QString &connectionName)
+{
+    if (connectionName.isEmpty()
+        || !QSqlDatabase::contains(connectionName)) {
+        return;
+    }
+    {
+        QSqlDatabase database =
+            QSqlDatabase::database(connectionName, false);
+        database.close();
+    }
+    QSqlDatabase::removeDatabase(connectionName);
+}
+
+bool PostgresSession::hasSameServerIdentity(
+    const PostgresConnectionConfig &config) const
+{
+    return configured_
+        && config_.host == config.host
+        && config_.port == config.port
+        && config_.user == config.user
+        && config_.password == config.password
+        && config_.sslMode == config.sslMode
+        && config_.connectTimeoutSeconds
+            == config.connectTimeoutSeconds;
 }
 
 bool PostgresSession::switchUser(const QString &user, QString *error)
@@ -197,20 +352,25 @@ bool PostgresSession::switchUser(const QString &user, QString *error)
 
 bool PostgresSession::setSessionUser(const QString &user, QString *error)
 {
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     if (!query.exec(QStringLiteral("RESET SESSION AUTHORIZATION"))) {
         assignError(error, queryError(query));
         return false;
     }
     currentUser_ = config_.user;
 
-    if (user == config_.user)
+    if (user == config_.user) {
+        databaseUsers_.insert(config_.database, currentUser_);
         return true;
-    if (!query.exec(QStringLiteral("SET SESSION AUTHORIZATION %1").arg(quoteIdentifier(user)))) {
+    }
+    if (!query.exec(QStringLiteral("SET SESSION AUTHORIZATION %1")
+                        .arg(quoteIdentifier(user)))) {
         assignError(error, queryError(query));
+        databaseUsers_.insert(config_.database, currentUser_);
         return false;
     }
     currentUser_ = user;
+    databaseUsers_.insert(config_.database, currentUser_);
     return true;
 }
 
@@ -222,14 +382,9 @@ bool PostgresSession::switchDatabase(const QString &databaseName, QString *error
         return false;
     }
 
-    const QString previousDatabase = config_.database;
-    if (openDatabase(databaseName, error))
+    if (databaseName == config_.database)
         return true;
-
-    QString restoreError;
-    if (!openDatabase(previousDatabase, &restoreError) && error)
-        *error += QStringLiteral("\n恢复原数据库连接也失败：%1").arg(restoreError);
-    return false;
+    return activateDatabase(databaseName, currentUser_, error);
 }
 
 QStringList PostgresSession::users(QString *error) const
@@ -240,7 +395,7 @@ QStringList PostgresSession::users(QString *error) const
         assignError(error, QStringLiteral("PostgreSQL 尚未连接。"));
         return result;
     }
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     query.setForwardOnly(true);
     if (!query.exec(QStringLiteral(
             "SELECT rolname FROM pg_catalog.pg_roles "
@@ -263,7 +418,7 @@ QStringList PostgresSession::databases(QString *error) const
         assignError(error, QStringLiteral("PostgreSQL 尚未连接。"));
         return result;
     }
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     query.setForwardOnly(true);
     if (!query.exec(QStringLiteral(
             "SELECT datname FROM pg_catalog.pg_database "
@@ -286,7 +441,7 @@ QStringList PostgresSession::schemas(QString *error) const
         assignError(error, QStringLiteral("PostgreSQL 尚未连接。"));
         return result;
     }
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     query.setForwardOnly(true);
     if (!query.exec(QStringLiteral(
             "SELECT schema_name FROM information_schema.schemata "
@@ -311,7 +466,7 @@ QVector<DatabaseRelation> PostgresSession::relations(const QString &schema,
         assignError(error, QStringLiteral("PostgreSQL 尚未连接。"));
         return result;
     }
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     query.setForwardOnly(true);
     query.prepare(QStringLiteral(
         "SELECT table_name, table_type FROM information_schema.tables "
@@ -345,7 +500,7 @@ DatabaseTable PostgresSession::describeTable(const QString &schema,
         assignError(error, QStringLiteral("PostgreSQL 尚未连接。"));
         return result;
     }
-    QSqlDatabase database = QSqlDatabase::database(connectionName_);
+    QSqlDatabase database = QSqlDatabase::database(activeConnectionName_);
 
     QSqlQuery summary(database);
     summary.setForwardOnly(true);
@@ -464,7 +619,7 @@ QueryResult PostgresSession::execute(const QString &sql, int rowLimit,
         return result;
     }
 
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     query.setForwardOnly(true);
     if (!query.exec(sql)) {
         assignError(error, queryError(query));
@@ -512,7 +667,7 @@ bool PostgresSession::cancelBackend(qint64 backendPid, QString *error) const
         return false;
     }
 
-    QSqlQuery query(QSqlDatabase::database(connectionName_));
+    QSqlQuery query(QSqlDatabase::database(activeConnectionName_));
     query.setForwardOnly(true);
     query.prepare(QStringLiteral("SELECT pg_catalog.pg_cancel_backend(:backend_pid)"));
     query.bindValue(QStringLiteral(":backend_pid"), backendPid);
@@ -556,7 +711,7 @@ bool PostgresSession::applyChanges(const QString &schema, const QString &table,
         }
     }
 
-    QSqlDatabase database = QSqlDatabase::database(connectionName_);
+    QSqlDatabase database = QSqlDatabase::database(activeConnectionName_);
     if (!database.transaction()) {
         assignError(error, databaseError());
         return false;
@@ -627,12 +782,13 @@ bool PostgresSession::applyChanges(const QString &schema, const QString &table,
 
 QString PostgresSession::quoteIdentifier(const QString &identifier) const
 {
-    if (!QSqlDatabase::contains(connectionName_)) {
+    if (!QSqlDatabase::contains(activeConnectionName_)) {
         QString escaped = identifier;
         escaped.replace(QLatin1Char('"'), QStringLiteral("\"\""));
         return QLatin1Char('"') + escaped + QLatin1Char('"');
     }
-    QSqlDatabase database = QSqlDatabase::database(connectionName_, false);
+    QSqlDatabase database =
+        QSqlDatabase::database(activeConnectionName_, false);
     return database.driver()->escapeIdentifier(identifier, QSqlDriver::FieldName);
 }
 
@@ -643,9 +799,10 @@ QString PostgresSession::qualifiedName(const QString &schema, const QString &rel
 
 QString PostgresSession::databaseError() const
 {
-    if (!QSqlDatabase::contains(connectionName_))
+    if (!QSqlDatabase::contains(activeConnectionName_))
         return QStringLiteral("PostgreSQL 连接不存在。");
-    const QSqlError error = QSqlDatabase::database(connectionName_, false).lastError();
+    const QSqlError error =
+        QSqlDatabase::database(activeConnectionName_, false).lastError();
     const QString databaseText = error.databaseText().trimmed();
     return databaseText.isEmpty() ? error.text().trimmed() : databaseText;
 }

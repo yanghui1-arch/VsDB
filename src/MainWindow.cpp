@@ -4,9 +4,12 @@
 #include "UiComponents.h"
 #include "WorkbenchModels.h"
 #include "database/postgres/PostgresQueryWorker.h"
+#include "database/redis/RedisProtocol.h"
 #include "ui/IconProvider.h"
 #include "ui/PostgresConnectionDialog.h"
 #include "ui/QueryPage.h"
+#include "ui/RedisConnectionDialog.h"
+#include "ui/RedisKeyPage.h"
 
 #include <QAction>
 #include <QApplication>
@@ -16,8 +19,10 @@
 #include <QFrame>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QItemSelectionModel>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMetaObject>
 #include <QMessageBox>
@@ -53,6 +58,13 @@ constexpr int TypeRole = Qt::UserRole + 1;
 constexpr int SchemaRole = Qt::UserRole + 2;
 constexpr int LoadedRole = Qt::UserRole + 3;
 constexpr int ConnectionIdRole = Qt::UserRole + 4;
+constexpr int DriverRole = Qt::UserRole + 5;
+constexpr int RedisDatabaseRole = Qt::UserRole + 6;
+constexpr int RedisCursorRole = Qt::UserRole + 7;
+constexpr int RedisKeyRole = Qt::UserRole + 8;
+constexpr int RedisLoadedCountRole = Qt::UserRole + 9;
+constexpr int OriginalIconRole = Qt::UserRole + 10;
+constexpr int MaximumRedisTreeKeys = 2000;
 
 const QString kInitialSql = QStringLiteral(
     "SELECT\n"
@@ -80,8 +92,11 @@ QStandardItem *schemaItem(const QString &text, const QString &type,
                           const QString &schema = {}, bool lazy = false)
 {
     auto *item = new QStandardItem(text);
-    if (!iconName.isEmpty())
-        item->setIcon(toolbarIcon(iconName));
+    if (!iconName.isEmpty()) {
+        const QIcon icon = toolbarIcon(iconName);
+        item->setIcon(icon);
+        item->setData(icon, OriginalIconRole);
+    }
     item->setData(name.isEmpty() ? text : name, NameRole);
     item->setData(type, TypeRole);
     item->setData(schema, SchemaRole);
@@ -105,6 +120,16 @@ void applyCachedAppearance(QStandardItem *item)
     }
     for (int row = 0; row < item->rowCount(); ++row)
         applyCachedAppearance(item->child(row));
+}
+
+void restoreActiveAppearance(QStandardItem *item)
+{
+    item->setData(QVariant{}, Qt::ForegroundRole);
+    const QVariant originalIcon = item->data(OriginalIconRole);
+    if (originalIcon.canConvert<QIcon>())
+        item->setIcon(qvariant_cast<QIcon>(originalIcon));
+    for (int row = 0; row < item->rowCount(); ++row)
+        restoreActiveAppearance(item->child(row));
 }
 
 void appendReadOnlyRow(QStandardItemModel *model, const QStringList &cells,
@@ -257,7 +282,7 @@ private:
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), credentialStore_(createPlatformCredentialStore())
 {
-    setWindowTitle(QStringLiteral("VsDB — PostgreSQL 数据库工作台"));
+    setWindowTitle(QStringLiteral("VsDB — 数据库工作台"));
     setMinimumSize(1100, 680);
     resize(1560, 920);
     createDatabaseToolBar();
@@ -284,6 +309,9 @@ MainWindow::MainWindow(QWidget *parent)
     QStringList connectionWarnings;
     savedConnections_ =
         ConnectionStore::load(settings, *credentialStore_, &connectionWarnings);
+    savedRedisConnections_ =
+        RedisConnectionStore::load(
+            settings, *credentialStore_, &connectionWarnings);
 
     populateSchema();
     installActions();
@@ -291,8 +319,10 @@ MainWindow::MainWindow(QWidget *parent)
     addQuery(kInitialSql);
     if (!savedConnections_.isEmpty())
         updateInspector(savedConnections_.constFirst(), false);
+    else if (!savedRedisConnections_.isEmpty())
+        updateInspector(savedRedisConnections_.constFirst(), false);
     else
-        updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+        updateInspector(QStringLiteral("Database"), QStringLiteral("connection"));
     updateConnectionUi();
 
     restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
@@ -325,6 +355,19 @@ bool MainWindow::connectToPostgres(const PostgresConnectionConfig &config, QStri
     cancelRunningQuery();
     if (!postgres_.connectToServer(config, error))
         return false;
+    activeConnectionId_.clear();
+    focusedDriver_ = QStringLiteral("postgresql");
+    refreshConnectionPresentation();
+    return true;
+}
+
+bool MainWindow::connectToRedis(const RedisConnectionConfig &config, QString *error)
+{
+    if (!redis_.connectToServer(config, error))
+        return false;
+    closeRedisPages();
+    activeRedisConnectionId_.clear();
+    focusedDriver_ = QStringLiteral("redis");
     refreshConnectionPresentation();
     return true;
 }
@@ -345,7 +388,8 @@ bool MainWindow::openRelationPreview(const QString &schema, const QString &relat
     QueryPage *page = currentQuery();
     const bool editable = !table.primaryKeys().isEmpty();
     if (editable)
-        page->setTableContext(schema, relation, table.primaryKeys());
+        page->setTableContext(postgres_.config().database, schema,
+                              relation, table.primaryKeys());
     updateInspector(table);
     runQuery(page, editable);
     return true;
@@ -369,29 +413,55 @@ void MainWindow::createDatabaseToolBar()
 
     auto *newConnection = new QToolButton(toolbar);
     newConnection->setIcon(toolbarIcon(QStringLiteral("database-zap")));
-    newConnection->setToolTip(QStringLiteral("新建 PostgreSQL 连接"));
+    newConnection->setToolTip(QStringLiteral("新建数据库连接"));
     newConnection->setPopupMode(QToolButton::MenuButtonPopup);
     auto *connectionMenu = new QMenu(newConnection);
     QAction *postgresAction = connectionMenu->addAction(
         toolbarIcon(QStringLiteral("postgresql")), QStringLiteral("PostgreSQL"));
     connect(postgresAction, &QAction::triggered, this, &MainWindow::showPostgresConnectionDialog);
+    QAction *redisAction = connectionMenu->addAction(
+        toolbarIcon(QStringLiteral("redis")), QStringLiteral("Redis"));
+    connect(redisAction, &QAction::triggered,
+            this, &MainWindow::showRedisConnectionDialog);
     connect(newConnection, &QToolButton::clicked, this, &MainWindow::showPostgresConnectionDialog);
     newConnection->setMenu(connectionMenu);
     toolbar->addWidget(newConnection);
 
     QAction *manage = addAction(QStringLiteral("cloud-cog"), QStringLiteral("连接设置"),
-                                QStringLiteral("编辑选中的 PostgreSQL 连接"));
+                                QStringLiteral("编辑选中的数据库连接"));
     connect(manage, &QAction::triggered, this, &MainWindow::editSelectedConnection);
     toolbar->addSeparator();
 
     QAction *connectAction = addAction(QStringLiteral("plug"), QStringLiteral("连接"),
-                                       QStringLiteral("连接选中的 PostgreSQL 数据库"));
+                                       QStringLiteral("连接选中的数据库"));
     connect(connectAction, &QAction::triggered, this, &MainWindow::connectSelectedConnection);
     reconnectAction_ = addAction(QStringLiteral("refresh-cw"), QStringLiteral("重新连接"),
                                  QStringLiteral("重新连接并刷新结构"));
     connect(reconnectAction_, &QAction::triggered, this, [this] {
-        cancelRunningQuery();
+        const QString driver = selectedConnectionDriver();
         QString error;
+        if (driver == QStringLiteral("redis") && redis_.isConnected()) {
+            if (!redis_.reconnect(&error)) {
+                if (!activeRedisConnectionId_.isEmpty()) {
+                    editRedisConnection(
+                        activeRedisConnectionId_,
+                        QStringLiteral("使用已保存凭据重新连接失败：\n%1\n\n请更新连接信息后重试。")
+                            .arg(error));
+                } else {
+                    showDatabaseError(QStringLiteral("重新连接失败"), error);
+                }
+                refreshConnectionPresentation();
+                return;
+            }
+            refreshConnectionPresentation();
+            statusBar()->showMessage(QStringLiteral("Redis 已重新连接"), 4000);
+            return;
+        }
+        if (driver != QStringLiteral("postgresql")
+            || !postgres_.isConnected()) {
+            return;
+        }
+        cancelRunningQuery();
         if (!postgres_.reconnect(&error)) {
             if (!activeConnectionId_.isEmpty()) {
                 const bool connected = editConnection(
@@ -410,12 +480,16 @@ void MainWindow::createDatabaseToolBar()
         statusBar()->showMessage(QStringLiteral("PostgreSQL 已重新连接"), 4000);
     });
     disconnectAction_ = addAction(QStringLiteral("unplug"), QStringLiteral("断开连接"),
-                                  QStringLiteral("断开 PostgreSQL 连接"));
+                                  QStringLiteral("断开当前数据库连接"));
     connect(disconnectAction_, &QAction::triggered, this, [this] {
-        cancelRunningQuery();
-        postgres_.disconnect();
+        const QString driver = selectedConnectionDriver();
+        disconnectActiveConnection();
         refreshConnectionPresentation();
-        statusBar()->showMessage(QStringLiteral("PostgreSQL 已断开"), 4000);
+        statusBar()->showMessage(
+            driver == QStringLiteral("redis")
+                ? QStringLiteral("Redis 已断开")
+                : QStringLiteral("PostgreSQL 已断开"),
+            4000);
     });
     toolbar->addSeparator();
 
@@ -641,6 +715,7 @@ void MainWindow::populateSchema()
     schemaModel_->clear();
     QStandardItem *selectedRoot = nullptr;
     QStandardItem *activeRoot = nullptr;
+    QStandardItem *activeRedisRoot = nullptr;
 
     for (const SavedConnection &connection : savedConnections_) {
         const bool active = postgres_.isConnected()
@@ -648,14 +723,14 @@ void MainWindow::populateSchema()
         const PostgresConnectionConfig &displayConfig =
             active ? postgres_.config() : connection.config;
         const QString text = active
-            ? QStringLiteral("PostgreSQL · %1（已连接）")
-                  .arg(displayConfig.displayName())
+            ? QStringLiteral("PostgreSQL · %1").arg(displayConfig.displayName())
             : QStringLiteral("PostgreSQL · %1（未连接）")
                   .arg(displayConfig.displayName());
         auto *root = schemaItem(text, QStringLiteral("connection"),
                                 QStringLiteral("postgresql"),
                                 displayConfig.displayName());
         root->setData(connection.id, ConnectionIdRole);
+        root->setData(QStringLiteral("postgresql"), DriverRole);
         root->setToolTip(active
             ? QStringLiteral("当前已连接")
             : QStringLiteral("双击后使用已保存的账号和密码自动连接"));
@@ -674,29 +749,341 @@ void MainWindow::populateSchema()
         populateActiveConnection(root);
     }
 
+    for (const SavedRedisConnection &connection : savedRedisConnections_) {
+        const bool active = redis_.isConnected()
+            && connection.id == activeRedisConnectionId_;
+        const RedisConnectionConfig &displayConfig =
+            active ? redis_.config() : connection.config;
+        const QString text = active
+            ? QStringLiteral("Redis · %1").arg(displayConfig.displayName())
+            : QStringLiteral("Redis · %1（未连接）")
+                  .arg(displayConfig.displayName());
+        auto *root = schemaItem(text, QStringLiteral("redis-connection"),
+                                QStringLiteral("redis"),
+                                displayConfig.displayName());
+        root->setData(connection.id, ConnectionIdRole);
+        root->setData(QStringLiteral("redis"), DriverRole);
+        root->setToolTip(
+            active ? QStringLiteral("当前已连接")
+                   : QStringLiteral("双击后使用已保存的凭据自动连接"));
+        schemaModel_->appendRow(root);
+        if (!selectedRoot)
+            selectedRoot = root;
+        if (connection.id == activeRedisConnectionId_)
+            selectedRoot = root;
+        if (active) {
+            activeRedisRoot = root;
+            selectedRoot = root;
+            populateActiveRedisConnection(root);
+        } else {
+            auto *databases = schemaItem(
+                QStringLiteral("Databases"),
+                QStringLiteral("redis-databases"),
+                QStringLiteral("database"));
+            root->appendRow(databases);
+            if (connection.databaseSnapshot.isEmpty()) {
+                auto *database = schemaItem(
+                    QStringLiteral("db%1").arg(displayConfig.database),
+                    QStringLiteral("redis-database"),
+                    QStringLiteral("database"),
+                    QStringLiteral("db%1").arg(displayConfig.database));
+                database->setData(
+                    displayConfig.database, RedisDatabaseRole);
+                databases->appendRow(database);
+            } else {
+                for (const RedisDatabaseInfo &databaseInfo :
+                     connection.databaseSnapshot) {
+                    auto *database = schemaItem(
+                        QStringLiteral("db%1 · %2 keys")
+                            .arg(databaseInfo.index)
+                            .arg(databaseInfo.keys),
+                        QStringLiteral("redis-database"),
+                        QStringLiteral("database"),
+                        QStringLiteral("db%1")
+                            .arg(databaseInfo.index));
+                    database->setData(
+                        databaseInfo.index, RedisDatabaseRole);
+                    database->setToolTip(
+                        QStringLiteral("上次成功连接时的数据库快照"));
+                    databases->appendRow(database);
+                }
+            }
+            applyCachedAppearance(databases);
+            schemaTree_->expand(schemaProxy_->mapFromSource(root->index()));
+            schemaTree_->expand(
+                schemaProxy_->mapFromSource(databases->index()));
+        }
+    }
+
     if (postgres_.isConnected() && !activeRoot) {
         auto *root = schemaItem(
             QStringLiteral("PostgreSQL · %1（本次会话）")
                 .arg(postgres_.config().displayName()),
             QStringLiteral("connection"), QStringLiteral("postgresql"),
             postgres_.config().displayName());
+        root->setData(QStringLiteral("postgresql"), DriverRole);
         schemaModel_->appendRow(root);
+        activeRoot = root;
         selectedRoot = root;
         populateActiveConnection(root);
-    } else if (!selectedRoot) {
+    }
+    if (redis_.isConnected() && !activeRedisRoot) {
+        auto *root = schemaItem(
+            QStringLiteral("Redis · %1（本次会话）")
+                .arg(redis_.config().displayName()),
+            QStringLiteral("redis-connection"), QStringLiteral("redis"),
+            redis_.config().displayName());
+        root->setData(QStringLiteral("redis"), DriverRole);
+        schemaModel_->appendRow(root);
+        activeRedisRoot = root;
+        selectedRoot = root;
+        populateActiveRedisConnection(root);
+    }
+    if (!selectedRoot) {
         selectedRoot = schemaItem(
             QStringLiteral("尚无已保存连接，点击左上角数据库图标添加"),
-            QStringLiteral("empty"), QStringLiteral("postgresql"),
-            QStringLiteral("PostgreSQL"));
+            QStringLiteral("empty"), QStringLiteral("database"),
+            QStringLiteral("Database"));
         schemaModel_->appendRow(selectedRoot);
     }
 
-    if (postgres_.isConnected()) {
+    if (focusedDriver_ == QStringLiteral("postgresql") && activeRoot)
+        selectedRoot = activeRoot;
+    else if (focusedDriver_ == QStringLiteral("redis") && activeRedisRoot)
+        selectedRoot = activeRedisRoot;
+    else if (activeRoot && !activeRedisRoot)
+        selectedRoot = activeRoot;
+    else if (activeRedisRoot && !activeRoot)
+        selectedRoot = activeRedisRoot;
+
+    if (postgres_.isConnected() || redis_.isConnected()) {
         schemaTree_->setCurrentIndex(
             schemaProxy_->mapFromSource(selectedRoot->index()));
     } else {
         schemaTree_->setCurrentIndex(QModelIndex{});
     }
+}
+
+void MainWindow::populateActiveRedisConnection(QStandardItem *root)
+{
+    auto *databases = schemaItem(
+        QStringLiteral("Databases"), QStringLiteral("redis-databases"),
+        QStringLiteral("database"), {}, {}, true);
+    root->appendRow(databases);
+    loadSchemaChildren(databases);
+    schemaTree_->expand(schemaProxy_->mapFromSource(root->index()));
+    schemaTree_->expand(schemaProxy_->mapFromSource(databases->index()));
+    for (int row = 0; row < databases->rowCount(); ++row) {
+        QStandardItem *database = databases->child(row);
+        if (database->data(RedisDatabaseRole).toInt()
+            != redis_.config().database) {
+            continue;
+        }
+        schemaTree_->expand(schemaProxy_->mapFromSource(database->index()));
+        if (database->rowCount() > 0) {
+            QStandardItem *keys = database->child(0);
+            loadSchemaChildren(keys);
+            schemaTree_->expand(schemaProxy_->mapFromSource(keys->index()));
+        }
+        break;
+    }
+}
+
+bool MainWindow::selectPostgresDatabaseInTree(const QString &database)
+{
+    for (int rootRow = 0; rootRow < schemaModel_->rowCount(); ++rootRow) {
+        QStandardItem *root = schemaModel_->item(rootRow);
+        if (!root
+            || root->data(DriverRole).toString()
+                != QStringLiteral("postgresql")) {
+            continue;
+        }
+        const QString connectionId =
+            root->data(ConnectionIdRole).toString();
+        if ((!activeConnectionId_.isEmpty()
+             && connectionId != activeConnectionId_)
+            || (activeConnectionId_.isEmpty()
+                && !connectionId.isEmpty())) {
+            continue;
+        }
+        root->setText(
+            QStringLiteral("PostgreSQL · %1")
+                .arg(postgres_.config().displayName()));
+        root->setData(postgres_.config().displayName(), NameRole);
+        for (int childRow = 0; childRow < root->rowCount(); ++childRow) {
+            QStandardItem *databases = root->child(childRow);
+            if (!databases
+                || databases->data(TypeRole).toString()
+                    != QStringLiteral("databases")) {
+                continue;
+            }
+            for (int databaseRow = 0;
+                 databaseRow < databases->rowCount(); ++databaseRow) {
+                QStandardItem *databaseItem =
+                    databases->child(databaseRow);
+                if (!databaseItem
+                    || databaseItem->data(NameRole).toString()
+                        != database) {
+                    continue;
+                }
+                const QModelIndex rootIndex =
+                    schemaProxy_->mapFromSource(root->index());
+                const QModelIndex databasesIndex =
+                    schemaProxy_->mapFromSource(databases->index());
+                const QModelIndex databaseIndex =
+                    schemaProxy_->mapFromSource(databaseItem->index());
+                schemaTree_->expand(rootIndex);
+                schemaTree_->expand(databasesIndex);
+                schemaTree_->expand(databaseIndex);
+                schemaTree_->setCurrentIndex(databaseIndex);
+                schemaTree_->scrollTo(
+                    databaseIndex, QAbstractItemView::PositionAtCenter);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+QString MainWindow::postgresDatabaseForIndex(
+    const QModelIndex &sourceIndex) const
+{
+    QModelIndex current = sourceIndex;
+    while (current.isValid()) {
+        if (current.data(TypeRole).toString()
+            == QStringLiteral("database")) {
+            return current.data(NameRole).toString();
+        }
+        current = current.parent();
+    }
+    return {};
+}
+
+bool MainWindow::activatePostgresDatabase(const QString &database,
+                                          QString *error)
+{
+    if (database.isEmpty()
+        || database == postgres_.config().database) {
+        return true;
+    }
+    if (!postgres_.switchDatabase(database, error))
+        return false;
+
+    QString saveError;
+    if (!activeConnectionId_.isEmpty()
+        && !persistActiveConnectionConfig(&saveError)) {
+        statusBar()->showMessage(
+            QStringLiteral("数据库已切换，但无法保存默认数据库：%1")
+                .arg(saveError),
+            5000);
+    }
+    updatePostgresDatabaseAppearance();
+    updateConnectionUi();
+    return true;
+}
+
+void MainWindow::updatePostgresDatabaseAppearance()
+{
+    for (int rootRow = 0; rootRow < schemaModel_->rowCount(); ++rootRow) {
+        QStandardItem *root = schemaModel_->item(rootRow);
+        if (!root
+            || root->data(DriverRole).toString()
+                != QStringLiteral("postgresql")) {
+            continue;
+        }
+        const QString connectionId =
+            root->data(ConnectionIdRole).toString();
+        if ((!activeConnectionId_.isEmpty()
+             && connectionId != activeConnectionId_)
+            || (activeConnectionId_.isEmpty()
+                && !connectionId.isEmpty())) {
+            continue;
+        }
+        for (int childRow = 0; childRow < root->rowCount(); ++childRow) {
+            QStandardItem *databases = root->child(childRow);
+            if (!databases
+                || databases->data(TypeRole).toString()
+                    != QStringLiteral("databases")) {
+                continue;
+            }
+            for (int databaseRow = 0;
+                 databaseRow < databases->rowCount(); ++databaseRow) {
+                QStandardItem *databaseItem =
+                    databases->child(databaseRow);
+                const QString database =
+                    databaseItem->data(NameRole).toString();
+                const bool connected =
+                    postgres_.isDatabaseConnected(database);
+                const bool current =
+                    database == postgres_.config().database;
+                if (connected && databaseItem->rowCount() == 0) {
+                    databaseItem->appendRow(schemaItem(
+                        QStringLiteral("Schemas"),
+                        QStringLiteral("schemas"),
+                        QStringLiteral("boxes"), {}, {}, true));
+                }
+                QFont font = databaseItem->font();
+                font.setBold(current);
+                databaseItem->setFont(font);
+                if (current) {
+                    restoreActiveAppearance(databaseItem);
+                    databaseItem->setToolTip(
+                        QStringLiteral("当前 PostgreSQL 数据库"));
+                } else if (connected) {
+                    restoreActiveAppearance(databaseItem);
+                    databaseItem->setToolTip(
+                        QStringLiteral("会话已保持连接，双击可切换"));
+                } else {
+                    applyCachedAppearance(databaseItem);
+                    databaseItem->setToolTip(
+                        QStringLiteral("双击可建立数据库连接"));
+                }
+            }
+        }
+    }
+}
+
+bool MainWindow::selectRedisDatabaseInTree(int database)
+{
+    for (int rootRow = 0; rootRow < schemaModel_->rowCount(); ++rootRow) {
+        QStandardItem *root = schemaModel_->item(rootRow);
+        if (!root
+            || root->data(DriverRole).toString() != QStringLiteral("redis")) {
+            continue;
+        }
+        for (int childRow = 0; childRow < root->rowCount(); ++childRow) {
+            QStandardItem *databases = root->child(childRow);
+            if (!databases
+                || databases->data(TypeRole).toString()
+                    != QStringLiteral("redis-databases")) {
+                continue;
+            }
+            for (int databaseRow = 0;
+                 databaseRow < databases->rowCount(); ++databaseRow) {
+                QStandardItem *databaseItem =
+                    databases->child(databaseRow);
+                if (!databaseItem
+                    || databaseItem->data(RedisDatabaseRole).toInt()
+                        != database) {
+                    continue;
+                }
+                const QModelIndex rootIndex =
+                    schemaProxy_->mapFromSource(root->index());
+                const QModelIndex databasesIndex =
+                    schemaProxy_->mapFromSource(databases->index());
+                const QModelIndex databaseIndex =
+                    schemaProxy_->mapFromSource(databaseItem->index());
+                schemaTree_->expand(rootIndex);
+                schemaTree_->expand(databasesIndex);
+                schemaTree_->expand(databaseIndex);
+                schemaTree_->setCurrentIndex(databaseIndex);
+                schemaTree_->scrollTo(
+                    databaseIndex, QAbstractItemView::PositionAtCenter);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void MainWindow::populateActiveConnection(QStandardItem *root)
@@ -866,11 +1253,101 @@ void MainWindow::updateConnectionSnapshot(
 
 void MainWindow::loadSchemaChildren(QStandardItem *item)
 {
-    if (!item || item->data(LoadedRole).toBool() || !postgres_.isConnected())
+    if (!item || item->data(LoadedRole).toBool())
         return;
 
     const QString type = item->data(TypeRole).toString();
+    if (type.startsWith(QStringLiteral("redis-"))) {
+        if (!redis_.isConnected())
+            return;
+        QString error;
+        item->setData(true, LoadedRole);
+        item->removeRows(0, item->rowCount());
+
+        if (type == QStringLiteral("redis-databases")) {
+            const QVector<RedisDatabaseInfo> databases = redis_.databases(&error);
+            if (!activeRedisConnectionId_.isEmpty()) {
+                if (SavedRedisConnection *connection =
+                        savedRedisConnection(
+                            activeRedisConnectionId_)) {
+                    connection->databaseSnapshot = databases;
+                    QSettings settings;
+                    QString snapshotError;
+                    if (!RedisConnectionStore::saveSnapshot(
+                            settings, *connection, &snapshotError)) {
+                        statusBar()->showMessage(
+                            snapshotError, 5000);
+                    }
+                }
+            }
+            for (const RedisDatabaseInfo &databaseInfo : databases) {
+                const bool current =
+                    databaseInfo.index == redis_.config().database;
+                QString text =
+                    QStringLiteral("db%1 · %2 keys")
+                        .arg(databaseInfo.index)
+                        .arg(databaseInfo.keys);
+                auto *database = schemaItem(
+                    text, QStringLiteral("redis-database"),
+                    QStringLiteral("database"),
+                    QStringLiteral("db%1").arg(databaseInfo.index));
+                database->setData(databaseInfo.index, RedisDatabaseRole);
+                if (current) {
+                    QFont font = database->font();
+                    font.setBold(true);
+                    database->setFont(font);
+                }
+                if (current) {
+                    auto *keys = schemaItem(
+                        QStringLiteral("Keys"), QStringLiteral("redis-keys"),
+                        QStringLiteral("key-round"), {}, {}, true);
+                    keys->setData(databaseInfo.index, RedisDatabaseRole);
+                    database->appendRow(keys);
+                } else {
+                    applyCachedAppearance(database);
+                    database->setToolTip(
+                        QStringLiteral("双击可切换到此 Redis 数据库"));
+                }
+                item->appendRow(database);
+            }
+        } else if (type == QStringLiteral("redis-keys")) {
+            const int database = item->data(RedisDatabaseRole).toInt();
+            if (database != redis_.config().database
+                && !redis_.selectDatabase(database, &error)) {
+                item->setData(false, LoadedRole);
+            } else {
+                if (!activeRedisConnectionId_.isEmpty()) {
+                    QString ignoredError;
+                    persistActiveRedisConnectionConfig(&ignoredError);
+                }
+                loadRedisKeys(item, QByteArrayLiteral("0"), false);
+                return;
+            }
+        }
+
+        if (!error.isEmpty()) {
+            item->setData(false, LoadedRole);
+            item->appendRow(schemaItem(
+                QStringLiteral("加载失败，展开重试"),
+                QStringLiteral("loading")));
+            showDatabaseError(QStringLiteral("加载 Redis 结构失败"), error);
+        }
+        return;
+    }
+
+    if (!postgres_.isConnected())
+        return;
+
     QString error;
+    const QString targetDatabase =
+        postgresDatabaseForIndex(item->index());
+    if (!targetDatabase.isEmpty()
+        && targetDatabase != postgres_.config().database
+        && !activatePostgresDatabase(targetDatabase, &error)) {
+        showDatabaseError(
+            QStringLiteral("切换 PostgreSQL 数据库失败"), error);
+        return;
+    }
     item->setData(true, LoadedRole);
     item->removeRows(0, item->rowCount());
 
@@ -878,8 +1355,9 @@ void MainWindow::loadSchemaChildren(QStandardItem *item)
         const QStringList users = postgres_.users(&error);
         for (const QString &user : users) {
             const bool current = user == postgres_.currentUser();
-            QStandardItem *child = schemaItem(current ? QStringLiteral("%1（当前）").arg(user) : user,
-                                              QStringLiteral("user"), QStringLiteral("key-round"), user);
+            QStandardItem *child = schemaItem(
+                user, QStringLiteral("user"),
+                QStringLiteral("key-round"), user);
             if (current) {
                 QFont font = child->font();
                 font.setBold(true);
@@ -891,15 +1369,30 @@ void MainWindow::loadSchemaChildren(QStandardItem *item)
         const QStringList databases = postgres_.databases(&error);
         for (const QString &databaseName : databases) {
             const bool current = databaseName == postgres_.config().database;
+            const bool connected =
+                postgres_.isDatabaseConnected(databaseName);
             QStandardItem *database = schemaItem(
-                current ? QStringLiteral("%1（当前）").arg(databaseName) : databaseName,
+                databaseName,
                 QStringLiteral("database"), QStringLiteral("database"), databaseName);
+            if (connected) {
+                database->appendRow(schemaItem(
+                    QStringLiteral("Schemas"),
+                    QStringLiteral("schemas"),
+                    QStringLiteral("boxes"), {}, {}, true));
+            }
             if (current) {
                 QFont font = database->font();
                 font.setBold(true);
                 database->setFont(font);
-                database->appendRow(schemaItem(QStringLiteral("Schemas"), QStringLiteral("schemas"),
-                                               QStringLiteral("boxes"), {}, {}, true));
+                database->setToolTip(
+                    QStringLiteral("当前 PostgreSQL 数据库"));
+            } else if (connected) {
+                database->setToolTip(
+                    QStringLiteral("会话已保持连接，双击可切换"));
+            } else {
+                applyCachedAppearance(database);
+                database->setToolTip(
+                    QStringLiteral("双击可建立数据库连接"));
             }
             item->appendRow(database);
         }
@@ -933,6 +1426,69 @@ void MainWindow::loadSchemaChildren(QStandardItem *item)
     }
 }
 
+void MainWindow::loadRedisKeys(QStandardItem *item,
+                               const QByteArray &cursor, bool append)
+{
+    if (!item || !redis_.isConnected())
+        return;
+
+    if (!append) {
+        item->removeRows(0, item->rowCount());
+        item->setData(0, RedisLoadedCountRole);
+    } else if (item->rowCount() > 0
+               && item->child(item->rowCount() - 1)
+                      ->data(TypeRole).toString()
+                   == QStringLiteral("redis-load-more")) {
+        item->removeRow(item->rowCount() - 1);
+    }
+
+    QString error;
+    const RedisScanPage page =
+        redis_.scanKeys(cursor, redisKeyPattern_, 200, &error);
+    if (!error.isEmpty()) {
+        showDatabaseError(QStringLiteral("加载 Redis 键失败"), error);
+        return;
+    }
+
+    int loaded = item->data(RedisLoadedCountRole).toInt();
+    for (const QByteArray &key : page.keys) {
+        if (loaded >= MaximumRedisTreeKeys)
+            break;
+        auto *keyItem = schemaItem(
+            redisDisplayBytes(key, 160), QStringLiteral("redis-key"),
+            QStringLiteral("key-round"));
+        keyItem->setData(key, RedisKeyRole);
+        keyItem->setToolTip(redisDisplayBytes(key, 4096));
+        item->appendRow(keyItem);
+        ++loaded;
+    }
+    item->setData(loaded, RedisLoadedCountRole);
+    item->setText(
+        redisKeyPattern_ == QByteArrayLiteral("*")
+            ? QStringLiteral("Keys · %1").arg(loaded)
+            : QStringLiteral("Keys · %1 · %2")
+                  .arg(redisDisplayBytes(redisKeyPattern_, 48))
+                  .arg(loaded));
+
+    if (page.nextCursor != QByteArrayLiteral("0")
+        && loaded < MaximumRedisTreeKeys) {
+        auto *more = schemaItem(
+            QStringLiteral("继续加载…"), QStringLiteral("redis-load-more"),
+            QStringLiteral("refresh-cw"));
+        more->setData(page.nextCursor, RedisCursorRole);
+        item->appendRow(more);
+    } else if (page.nextCursor != QByteArrayLiteral("0")) {
+        item->appendRow(schemaItem(
+            QStringLiteral("已达到 %1 个键的可视化上限，请缩小数据范围")
+                .arg(MaximumRedisTreeKeys),
+            QStringLiteral("redis-limit"), QStringLiteral("key-round")));
+    } else if (loaded == 0) {
+        item->appendRow(schemaItem(
+            QStringLiteral("此数据库暂无键"),
+            QStringLiteral("redis-empty"), QStringLiteral("key-round")));
+    }
+}
+
 void MainWindow::installActions()
 {
     auto *run = new QAction(this);
@@ -956,9 +1512,16 @@ void MainWindow::installActions()
 void MainWindow::addQuery(const QString &sql)
 {
     auto *page = new QueryPage(sql.isEmpty() ? QStringLiteral("SELECT version();") : sql, queryTabs_);
+    if (postgres_.isConnected())
+        page->setDatabaseContext(postgres_.config().database);
     const QString title = QStringLiteral("Query %1").arg(queryNumber_++);
     page->setProperty("tabTitle", title);
     const int index = queryTabs_->addTab(page, toolbarIcon(QStringLiteral("file-code")), title);
+    if (!page->databaseContext().isEmpty()) {
+        queryTabs_->setTabToolTip(
+            index, QStringLiteral("PostgreSQL / %1")
+                       .arg(page->databaseContext()));
+    }
     auto *closeButton = new QToolButton(queryTabs_->tabBar());
     closeButton->setObjectName(QStringLiteral("tabCloseButton"));
     closeButton->setIcon(toolbarIcon(QStringLiteral("x")));
@@ -1066,6 +1629,27 @@ void MainWindow::runQuery(QueryPage *page, bool editableTable)
             : QStringLiteral("另一项查询正在执行；完成后可继续执行"));
         return;
     }
+    if (page->databaseContext().isEmpty()) {
+        page->setDatabaseContext(postgres_.config().database);
+        const int pageIndex = queryTabs_->indexOf(page);
+        if (pageIndex >= 0) {
+            queryTabs_->setTabToolTip(
+                pageIndex, QStringLiteral("PostgreSQL / %1")
+                               .arg(page->databaseContext()));
+        }
+    } else if (page->databaseContext()
+               != postgres_.config().database) {
+        QString error;
+        if (!activatePostgresDatabase(
+                page->databaseContext(), &error)) {
+            showDatabaseError(
+                QStringLiteral("无法切换到查询所属数据库"), error);
+            page->setStatus(
+                QStringLiteral("查询未执行：标签属于数据库 %1")
+                    .arg(page->databaseContext()));
+            return;
+        }
+    }
 
     page->beginExecution();
     runningQueryPage_ = page;
@@ -1115,11 +1699,25 @@ void MainWindow::stopQuery()
 
 void MainWindow::refreshSchema()
 {
+    const QString driver = selectedConnectionDriver();
+    if (driver == QStringLiteral("redis")) {
+        if (!redis_.isConnected()) {
+            connectSelectedConnection();
+            return;
+        }
+        populateSchema();
+        selectRedisDatabaseInTree(redis_.config().database);
+        statusBar()->showMessage(QStringLiteral("Redis 键空间已刷新"), 3000);
+        return;
+    }
+    if (driver != QStringLiteral("postgresql"))
+        return;
     if (!postgres_.isConnected()) {
         connectSelectedConnection();
         return;
     }
     populateSchema();
+    selectPostgresDatabaseInTree(postgres_.config().database);
     statusBar()->showMessage(QStringLiteral("数据库结构已刷新"), 3000);
 }
 
@@ -1146,10 +1744,40 @@ void MainWindow::handleSchemaSelection()
     const QString type = source.data(TypeRole).toString();
     const QString schema = source.data(SchemaRole).toString();
     const QString connectionId = connectionIdForIndex(source);
+    const QString driver = driverForIndex(source);
+    if (!driver.isEmpty()) {
+        focusedDriver_ = driver;
+        updateConnectionUi();
+    }
+    if (driver == QStringLiteral("redis")) {
+        if (!connectionId.isEmpty()
+            && (!redis_.isConnected()
+                || connectionId != activeRedisConnectionId_)) {
+            if (const SavedRedisConnection *connection =
+                    savedRedisConnection(connectionId)) {
+                updateInspector(*connection, false);
+                return;
+            }
+        }
+        updateInspector(name, type, schema);
+        return;
+    }
     if (!connectionId.isEmpty()
         && (!postgres_.isConnected() || connectionId != activeConnectionId_)) {
         if (const SavedConnection *connection = savedConnection(connectionId)) {
             updateInspector(*connection, false);
+            return;
+        }
+    }
+    const QString targetDatabase =
+        postgresDatabaseForIndex(source);
+    if (type != QStringLiteral("database")
+        && !targetDatabase.isEmpty()
+        && targetDatabase != postgres_.config().database) {
+        QString error;
+        if (!activatePostgresDatabase(targetDatabase, &error)) {
+            showDatabaseError(
+                QStringLiteral("切换 PostgreSQL 数据库失败"), error);
             return;
         }
     }
@@ -1176,7 +1804,64 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
     const QString name = source.data(NameRole).toString();
     const QString schema = source.data(SchemaRole).toString();
     const QString connectionId = connectionIdForIndex(source);
+    const QString driver = driverForIndex(source);
     QString error;
+
+    if (driver == QStringLiteral("redis")) {
+        if (!connectionId.isEmpty()
+            && (!redis_.isConnected()
+                || connectionId != activeRedisConnectionId_)) {
+            connectSavedRedisConnection(connectionId);
+            return;
+        }
+        if (type == QStringLiteral("redis-connection")) {
+            schemaTree_->setExpanded(proxyIndex,
+                                     !schemaTree_->isExpanded(proxyIndex));
+            return;
+        }
+        if (type == QStringLiteral("redis-database")) {
+            const int database = source.data(RedisDatabaseRole).toInt();
+            if (database == redis_.config().database) {
+                schemaTree_->setExpanded(
+                    proxyIndex, !schemaTree_->isExpanded(proxyIndex));
+                return;
+            }
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            const bool selected = redis_.selectDatabase(database, &error);
+            QApplication::restoreOverrideCursor();
+            if (!selected) {
+                showDatabaseError(QStringLiteral("切换 Redis 数据库失败"), error);
+                return;
+            }
+            closeRedisPages();
+            QString saveError;
+            const bool saved = persistActiveRedisConnectionConfig(&saveError);
+            populateSchema();
+            selectRedisDatabaseInTree(database);
+            statusBar()->showMessage(
+                saved || activeRedisConnectionId_.isEmpty()
+                    ? QStringLiteral("当前 Redis 数据库已切换为 db%1")
+                          .arg(database)
+                    : QStringLiteral("已切换到 db%1，但无法保存默认数据库：%2")
+                          .arg(database).arg(saveError),
+                6000);
+            return;
+        }
+        if (type == QStringLiteral("redis-key")) {
+            openRedisKey(source.data(RedisKeyRole).toByteArray());
+            return;
+        }
+        if (type == QStringLiteral("redis-load-more")) {
+            QStandardItem *more = schemaModel_->itemFromIndex(source);
+            if (more && more->parent()) {
+                loadRedisKeys(
+                    more->parent(),
+                    source.data(RedisCursorRole).toByteArray(), true);
+            }
+            return;
+        }
+        return;
+    }
 
     if (!connectionId.isEmpty()
         && (!postgres_.isConnected() || connectionId != activeConnectionId_)) {
@@ -1226,8 +1911,17 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
         }
         QString saveError;
         const bool saved = persistActiveConnectionConfig(&saveError);
+        updatePostgresDatabaseAppearance();
         updateConnectionUi();
-        populateSchema();
+        selectPostgresDatabaseInTree(name);
+        QStandardItem *databaseItem =
+            schemaModel_->itemFromIndex(source);
+        if (databaseItem && databaseItem->rowCount() > 0) {
+            QStandardItem *schemas = databaseItem->child(0);
+            loadSchemaChildren(schemas);
+            schemaTree_->expand(
+                schemaProxy_->mapFromSource(schemas->index()));
+        }
         statusBar()->showMessage(
             saved
                 ? QStringLiteral("当前数据库已切换为 %1").arg(name)
@@ -1252,7 +1946,8 @@ void MainWindow::activateSchemaItem(const QModelIndex &proxyIndex)
     QueryPage *page = currentQuery();
     const bool editable = type == QStringLiteral("Table") && !table.primaryKeys().isEmpty();
     if (editable)
-        page->setTableContext(schema, name, table.primaryKeys());
+        page->setTableContext(postgres_.config().database, schema,
+                              name, table.primaryKeys());
     else
         page->clearTableContext();
     runQuery(page, editable);
@@ -1264,6 +1959,16 @@ void MainWindow::applyPendingChanges(QueryPage *page)
         return;
     QString error;
     ResultTableModel *model = page->resultModel();
+    if (!page->tableDatabase().isEmpty()
+        && page->tableDatabase() != postgres_.config().database
+        && !activatePostgresDatabase(page->tableDatabase(), &error)) {
+        showDatabaseError(
+            QStringLiteral("无法切换到结果所属数据库"), error);
+        page->setStatus(
+            QStringLiteral("提交失败：结果属于数据库 %1")
+                .arg(page->tableDatabase()));
+        return;
+    }
     QApplication::setOverrideCursor(Qt::WaitCursor);
     const bool applied = postgres_.applyChanges(
         page->tableSchema(), page->tableName(), model->columns(), model->originalRows(),
@@ -1285,7 +1990,44 @@ void MainWindow::updateInspector(const QString &name, const QString &type,
     QString iconName = QStringLiteral("boxes");
     QString displayType = type;
     QString path;
-    if (type == QStringLiteral("connection")) {
+    if (type == QStringLiteral("redis-connection")) {
+        iconName = QStringLiteral("redis");
+        displayType = redis_.isConnected()
+            ? QStringLiteral("Redis connection")
+            : QStringLiteral("Disconnected");
+        path = redis_.isConnected()
+            ? redis_.config().displayName()
+            : QStringLiteral("双击连接以开始");
+        description_->setText(
+            redis_.isConnected()
+                ? QStringLiteral("TLS：%1 · 当前数据库：db%2")
+                      .arg(redis_.config().tls ? QStringLiteral("已启用")
+                                              : QStringLiteral("未启用"))
+                      .arg(redis_.config().database)
+                : QStringLiteral("—"));
+    } else if (type == QStringLiteral("redis-database")) {
+        iconName = QStringLiteral("database");
+        displayType = QStringLiteral("Redis database");
+        path = QStringLiteral("%1 / %2")
+                   .arg(redis_.config().host, name);
+    } else if (type == QStringLiteral("redis-databases")) {
+        iconName = QStringLiteral("database");
+        displayType = QStringLiteral("Redis databases");
+        path = redis_.config().host;
+    } else if (type == QStringLiteral("redis-keys")) {
+        iconName = QStringLiteral("key-round");
+        displayType = QStringLiteral("Redis keys");
+        path = QStringLiteral("%1 / db%2")
+                   .arg(redis_.config().host)
+                   .arg(redis_.config().database);
+    } else if (type == QStringLiteral("redis-key")) {
+        iconName = QStringLiteral("key-round");
+        displayType = QStringLiteral("Redis key");
+        path = QStringLiteral("%1 / db%2 / %3")
+                   .arg(redis_.config().host)
+                   .arg(redis_.config().database)
+                   .arg(name);
+    } else if (type == QStringLiteral("connection")) {
         iconName = QStringLiteral("postgresql");
         displayType = postgres_.isConnected() ? QStringLiteral("PostgreSQL connection")
                                               : QStringLiteral("Disconnected");
@@ -1331,8 +2073,35 @@ void MainWindow::updateInspector(const QString &name, const QString &type,
     objectPath_->setText(path);
     rowEstimate_->setText(QStringLiteral("—"));
     size_->setText(QStringLiteral("—"));
-    if (type != QStringLiteral("connection"))
+    if (type != QStringLiteral("connection")
+        && type != QStringLiteral("redis-connection"))
         description_->setText(QStringLiteral("—"));
+    clearInspectorModels();
+}
+
+void MainWindow::updateInspector(const SavedRedisConnection &connection,
+                                 bool connected)
+{
+    const RedisConnectionConfig &config =
+        connected ? redis_.config() : connection.config;
+    objectIcon_->setPixmap(
+        toolbarIcon(QStringLiteral("redis")).pixmap(QSize(20, 20)));
+    objectName_->setText(config.displayName());
+    objectType_->setText(
+        connected ? QStringLiteral("Redis connection")
+                  : QStringLiteral("Saved connection · Disconnected"));
+    objectPath_->setText(config.displayName());
+    rowEstimate_->setText(QStringLiteral("—"));
+    size_->setText(QStringLiteral("—"));
+    description_->setText(
+        connected
+            ? QStringLiteral("TLS：%1 · 当前数据库：db%2")
+                  .arg(config.tls ? QStringLiteral("已启用")
+                                  : QStringLiteral("未启用"))
+                  .arg(config.database)
+            : connection.hasStoredPassword
+                ? QStringLiteral("双击左侧连接即可使用已保存凭据连接")
+                : QStringLiteral("未找到已保存密码；双击后可重新输入"));
     clearInspectorModels();
 }
 
@@ -1398,37 +2167,124 @@ void MainWindow::updateConnectionUi()
 {
     connectionContext_->clear();
     schemaContext_->clear();
-    const bool connected = postgres_.isConnected();
-    reconnectAction_->setEnabled(connected);
-    disconnectAction_->setEnabled(connected);
-    if (!connected) {
-        const SavedConnection *active = savedConnection(activeConnectionId_);
-        const QString label = active
-            ? QStringLiteral("%1 · 未连接").arg(active->config.displayName())
-            : savedConnections_.isEmpty()
-                  ? QStringLiteral("PostgreSQL · 未连接")
-                  : QStringLiteral("%1 个已保存连接").arg(savedConnections_.size());
-        connectionContext_->addItem(toolbarIcon(QStringLiteral("postgresql")), label);
-        schemaContext_->addItem(toolbarIcon(QStringLiteral("boxes")), QStringLiteral("无活动数据库"));
+    const QString driver = selectedConnectionDriver();
+    bool driverConnected =
+        driver == QStringLiteral("redis")
+        ? redis_.isConnected()
+        : driver == QStringLiteral("postgresql")
+            ? postgres_.isConnected()
+            : false;
+    if (driver == QStringLiteral("postgresql")
+        && schemaTree_->currentIndex().isValid()) {
+        const QString database = postgresDatabaseForIndex(
+            schemaProxy_->mapToSource(schemaTree_->currentIndex()));
+        if (!database.isEmpty())
+            driverConnected =
+                postgres_.isDatabaseConnected(database);
+    }
+    reconnectAction_->setEnabled(driverConnected);
+    disconnectAction_->setEnabled(driverConnected);
+
+    if (driver == QStringLiteral("redis")) {
+        if (redis_.isConnected()) {
+            connectionContext_->addItem(
+                toolbarIcon(QStringLiteral("redis")),
+                redis_.config().displayName());
+            schemaContext_->addItem(
+                toolbarIcon(QStringLiteral("database")),
+                QStringLiteral("db%1").arg(redis_.config().database));
+            return;
+        }
+        const QString connectionId = selectedConnectionId().isEmpty()
+            ? activeRedisConnectionId_ : selectedConnectionId();
+        const SavedRedisConnection *connection =
+            savedRedisConnection(connectionId);
+        connectionContext_->addItem(
+            toolbarIcon(QStringLiteral("redis")),
+            connection
+                ? QStringLiteral("%1 · 未连接")
+                      .arg(connection->config.displayName())
+                : QStringLiteral("Redis · 未连接"));
+        schemaContext_->addItem(
+            toolbarIcon(QStringLiteral("database")),
+            QStringLiteral("无活动数据库"));
         return;
     }
 
-    const QString label = QStringLiteral("%1@%2 / %3")
-                              .arg(postgres_.currentUser(), postgres_.config().host,
-                                   postgres_.config().database);
-    connectionContext_->addItem(toolbarIcon(QStringLiteral("postgresql")), label);
-    schemaContext_->addItem(toolbarIcon(QStringLiteral("boxes")),
-                            QStringLiteral("public @ %1").arg(postgres_.config().database));
+    if (driver == QStringLiteral("postgresql")) {
+        if (postgres_.isConnected()) {
+            const QString label = QStringLiteral("%1@%2 / %3")
+                                      .arg(postgres_.currentUser(),
+                                           postgres_.config().host,
+                                           postgres_.config().database);
+            connectionContext_->addItem(
+                toolbarIcon(QStringLiteral("postgresql")), label);
+            schemaContext_->addItem(
+                toolbarIcon(QStringLiteral("boxes")),
+                QStringLiteral("public @ %1")
+                    .arg(postgres_.config().database));
+            return;
+        }
+        const QString connectionId = selectedConnectionId().isEmpty()
+            ? activeConnectionId_ : selectedConnectionId();
+        const SavedConnection *connection =
+            savedConnection(connectionId);
+        connectionContext_->addItem(
+            toolbarIcon(QStringLiteral("postgresql")),
+            connection
+                ? QStringLiteral("%1 · 未连接")
+                      .arg(connection->config.displayName())
+                : QStringLiteral("PostgreSQL · 未连接"));
+        schemaContext_->addItem(
+            toolbarIcon(QStringLiteral("boxes")),
+            QStringLiteral("无活动数据库"));
+        return;
+    }
+
+    const int savedCount =
+        savedConnections_.size() + savedRedisConnections_.size();
+    connectionContext_->addItem(
+        toolbarIcon(QStringLiteral("database-zap")),
+        savedCount == 0
+            ? QStringLiteral("数据库 · 未连接")
+            : QStringLiteral("%1 个已保存连接").arg(savedCount));
+    schemaContext_->addItem(
+        toolbarIcon(QStringLiteral("boxes")),
+        QStringLiteral("无活动数据库"));
 }
 
 void MainWindow::refreshConnectionPresentation()
 {
-    updateConnectionUi();
     populateSchema();
-    if (const SavedConnection *active = savedConnection(activeConnectionId_))
-        updateInspector(*active, postgres_.isConnected());
-    else
-        updateInspector(QStringLiteral("PostgreSQL"), QStringLiteral("connection"));
+    if (focusedDriver_ == QStringLiteral("postgresql")
+        && postgres_.isConnected()) {
+        selectPostgresDatabaseInTree(postgres_.config().database);
+    } else if (focusedDriver_ == QStringLiteral("redis")
+               && redis_.isConnected()) {
+        selectRedisDatabaseInTree(redis_.config().database);
+    }
+    updateConnectionUi();
+    if (focusedDriver_ == QStringLiteral("redis")) {
+        if (const SavedRedisConnection *active =
+                savedRedisConnection(activeRedisConnectionId_)) {
+            updateInspector(*active, redis_.isConnected());
+        } else if (redis_.isConnected()) {
+            updateInspector(redis_.config().displayName(),
+                            QStringLiteral("redis-connection"));
+        }
+        return;
+    }
+    if (focusedDriver_ == QStringLiteral("postgresql")) {
+        if (const SavedConnection *active =
+                savedConnection(activeConnectionId_)) {
+            updateInspector(*active, postgres_.isConnected());
+        } else if (postgres_.isConnected()) {
+            updateInspector(QStringLiteral("PostgreSQL"),
+                            QStringLiteral("connection"));
+        }
+        return;
+    }
+    updateInspector(QStringLiteral("Database"), QStringLiteral("connection"));
 }
 
 void MainWindow::showPostgresConnectionDialog()
@@ -1436,8 +2292,22 @@ void MainWindow::showPostgresConnectionDialog()
     editConnection(QString{});
 }
 
+void MainWindow::showRedisConnectionDialog()
+{
+    editRedisConnection(QString{});
+}
+
 void MainWindow::editSelectedConnection()
 {
+    const QString driver = selectedConnectionDriver();
+    if (driver == QStringLiteral("redis")
+        || (driver.isEmpty() && redis_.isConnected())) {
+        editRedisConnection(
+            selectedConnectionId().isEmpty()
+                ? activeRedisConnectionId_
+                : selectedConnectionId());
+        return;
+    }
     editConnection(preferredConnectionId());
 }
 
@@ -1464,8 +2334,10 @@ bool MainWindow::editConnection(
         PostgresConnectionDialog dialog(this);
         if (hasInitialConfig)
             dialog.setConfig(candidate);
-        if (dialog.exec() != QDialog::Accepted)
+        if (dialog.exec() != QDialog::Accepted) {
+            refreshConnectionPresentation();
             return false;
+        }
 
         candidate = dialog.config();
         hasInitialConfig = true;
@@ -1509,6 +2381,7 @@ bool MainWindow::editConnection(
             }
         }
 
+        focusedDriver_ = QStringLiteral("postgresql");
         refreshConnectionPresentation();
         statusBar()->showMessage(
             saved
@@ -1521,6 +2394,17 @@ bool MainWindow::editConnection(
 
 void MainWindow::connectSelectedConnection()
 {
+    const QString driver = selectedConnectionDriver();
+    if (driver == QStringLiteral("redis")
+        || (driver.isEmpty() && !activeRedisConnectionId_.isEmpty())) {
+        const QString connectionId = selectedConnectionId().isEmpty()
+            ? activeRedisConnectionId_ : selectedConnectionId();
+        if (connectionId.isEmpty())
+            showRedisConnectionDialog();
+        else
+            connectSavedRedisConnection(connectionId);
+        return;
+    }
     const QString connectionId = preferredConnectionId();
     if (connectionId.isEmpty()) {
         showPostgresConnectionDialog();
@@ -1543,6 +2427,26 @@ void MainWindow::connectSavedConnection(
     if (!stored)
         return;
     if (postgres_.isConnected() && connectionId == activeConnectionId_) {
+        if (!database.isEmpty()
+            && database != postgres_.config().database) {
+            QString error;
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            const bool activated =
+                activatePostgresDatabase(database, &error);
+            QApplication::restoreOverrideCursor();
+            if (!activated) {
+                showDatabaseError(
+                    QStringLiteral("连接 PostgreSQL 数据库失败"),
+                    error);
+                return;
+            }
+            populateSchema();
+            selectPostgresDatabaseInTree(database);
+            statusBar()->showMessage(
+                QStringLiteral("已连接并切换到 %1").arg(database),
+                4000);
+            return;
+        }
         statusBar()->showMessage(QStringLiteral("该数据库已经连接"), 3000);
         return;
     }
@@ -1574,6 +2478,7 @@ void MainWindow::connectSavedConnection(
     }
 
     activeConnectionId_ = connectionId;
+    focusedDriver_ = QStringLiteral("postgresql");
     QString saveError;
     const bool saved = persistActiveConnectionConfig(&saveError);
     refreshConnectionPresentation();
@@ -1599,13 +2504,434 @@ bool MainWindow::persistActiveConnectionConfig(QString *error)
         settings, *credentialStore_, *connection, error);
 }
 
+bool MainWindow::editRedisConnection(
+    const QString &connectionId, const QString &notice,
+    const std::optional<RedisConnectionConfig> &initialConfig)
+{
+    SavedRedisConnection draft;
+    bool hasInitialConfig = false;
+    if (const SavedRedisConnection *existing =
+            savedRedisConnection(connectionId)) {
+        draft = *existing;
+        hasInitialConfig = true;
+    }
+    if (initialConfig) {
+        draft.config = *initialConfig;
+        hasInitialConfig = true;
+    }
+
+    if (!notice.isEmpty())
+        QMessageBox::warning(this, QStringLiteral("需要更新 Redis 连接信息"), notice);
+
+    RedisConnectionConfig candidate = draft.config;
+    while (true) {
+        RedisConnectionDialog dialog(this);
+        if (hasInitialConfig)
+            dialog.setConfig(candidate);
+        if (dialog.exec() != QDialog::Accepted) {
+            refreshConnectionPresentation();
+            return false;
+        }
+
+        candidate = dialog.config();
+        hasInitialConfig = true;
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QString connectionError;
+        const bool connected =
+            redis_.connectToServer(candidate, &connectionError);
+        QApplication::restoreOverrideCursor();
+        if (!connected) {
+            QMessageBox::warning(
+                this, QStringLiteral("Redis 连接失败"),
+                QStringLiteral("%1\n\n请检查连接地址、TLS、ACL 用户、密码和数据库编号。")
+                    .arg(connectionError.isEmpty()
+                             ? QStringLiteral("未知 Redis 错误")
+                             : connectionError));
+            continue;
+        }
+
+        closeRedisPages();
+        draft.config = candidate;
+        QSettings settings;
+        QString saveError;
+        const bool saved = RedisConnectionStore::upsert(
+            settings, *credentialStore_, draft, &saveError);
+        if (saved) {
+            if (SavedRedisConnection *existing =
+                    savedRedisConnection(draft.id)) {
+                *existing = draft;
+            } else {
+                savedRedisConnections_.append(draft);
+            }
+            activeRedisConnectionId_ = draft.id;
+        } else {
+            QMessageBox::warning(
+                this, QStringLiteral("连接已建立，但无法保存"),
+                QStringLiteral("%1\n\n本次会话仍可使用该连接；密码不会明文写入设置。")
+                    .arg(saveError));
+            if (!draft.id.isEmpty()) {
+                if (SavedRedisConnection *existing =
+                        savedRedisConnection(draft.id)) {
+                    *existing = draft;
+                }
+                activeRedisConnectionId_ = draft.id;
+            } else {
+                activeRedisConnectionId_.clear();
+            }
+        }
+
+        focusedDriver_ = QStringLiteral("redis");
+        refreshConnectionPresentation();
+        statusBar()->showMessage(
+            saved
+                ? QStringLiteral("已连接并安全保存 %1")
+                      .arg(redis_.config().displayName())
+                : QStringLiteral("已连接 %1（未保存）")
+                      .arg(redis_.config().displayName()),
+            6000);
+        return true;
+    }
+}
+
+void MainWindow::connectSavedRedisConnection(const QString &connectionId)
+{
+    const SavedRedisConnection *stored =
+        savedRedisConnection(connectionId);
+    if (!stored)
+        return;
+    if (redis_.isConnected()
+        && connectionId == activeRedisConnectionId_) {
+        statusBar()->showMessage(QStringLiteral("该 Redis 已经连接"), 3000);
+        return;
+    }
+    if (!stored->hasStoredPassword) {
+        editRedisConnection(
+            connectionId,
+            QStringLiteral("没有找到此 Redis 连接的已保存密码，请重新输入连接信息。"),
+            stored->config);
+        return;
+    }
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QString error;
+    const bool connected =
+        redis_.connectToServer(stored->config, &error);
+    QApplication::restoreOverrideCursor();
+    if (!connected) {
+        editRedisConnection(
+            connectionId,
+            QStringLiteral("使用已保存凭据自动连接 Redis 失败：\n%1")
+                .arg(error.isEmpty() ? QStringLiteral("未知 Redis 错误")
+                                     : error),
+            stored->config);
+        return;
+    }
+
+    closeRedisPages();
+    activeRedisConnectionId_ = connectionId;
+    focusedDriver_ = QStringLiteral("redis");
+    refreshConnectionPresentation();
+    statusBar()->showMessage(
+        QStringLiteral("已使用保存的凭据连接 %1")
+            .arg(stored->config.displayName()),
+        6000);
+}
+
+bool MainWindow::persistActiveRedisConnectionConfig(QString *error)
+{
+    SavedRedisConnection *connection =
+        savedRedisConnection(activeRedisConnectionId_);
+    if (!connection) {
+        if (error)
+            *error = QStringLiteral("当前 Redis 连接尚未保存。");
+        return false;
+    }
+    connection->config = redis_.config();
+    QSettings settings;
+    return RedisConnectionStore::upsert(
+        settings, *credentialStore_, *connection, error);
+}
+
+void MainWindow::createRedisKey()
+{
+    if (!redis_.isConnected()) {
+        statusBar()->showMessage(QStringLiteral("请先连接 Redis"), 4000);
+        return;
+    }
+    bool accepted = false;
+    const QString typeLabel = QInputDialog::getItem(
+        this, QStringLiteral("新建 Redis 键"),
+        QStringLiteral("数据类型"),
+        {QStringLiteral("String"), QStringLiteral("Hash"),
+         QStringLiteral("List"), QStringLiteral("Set"),
+         QStringLiteral("Sorted Set"), QStringLiteral("Stream")},
+        0, false, &accepted);
+    if (!accepted)
+        return;
+
+    QByteArray type = typeLabel.toLower().toLatin1();
+    if (typeLabel == QStringLiteral("Sorted Set"))
+        type = QByteArrayLiteral("zset");
+    const QString keyText = QInputDialog::getText(
+        this, QStringLiteral("新建 Redis 键"),
+        QStringLiteral("键名"), QLineEdit::Normal, {}, &accepted);
+    if (!accepted || keyText.isEmpty())
+        return;
+
+    QByteArray identity;
+    QByteArray value;
+    if (type == QByteArrayLiteral("string")) {
+        const QString valueText = QInputDialog::getMultiLineText(
+            this, QStringLiteral("新建 Redis String"),
+            QStringLiteral("值"), {}, &accepted);
+        if (!accepted)
+            return;
+        value = valueText.toUtf8();
+    } else if (type == QByteArrayLiteral("list")) {
+        const QString listValue = QInputDialog::getMultiLineText(
+            this, QStringLiteral("新建 Redis List"),
+            QStringLiteral("第一个元素"), {}, &accepted);
+        if (!accepted || listValue.isEmpty())
+            return;
+        identity = listValue.toUtf8();
+    } else {
+        const QString identityLabel =
+            type == QByteArrayLiteral("hash")
+                || type == QByteArrayLiteral("stream")
+            ? QStringLiteral("第一个字段")
+            : QStringLiteral("第一个成员");
+        const QString identityText = QInputDialog::getText(
+            this, QStringLiteral("新建 Redis 键"),
+            identityLabel, QLineEdit::Normal, {}, &accepted);
+        if (!accepted || identityText.isEmpty())
+            return;
+        identity = identityText.toUtf8();
+        if (type == QByteArrayLiteral("hash")
+            || type == QByteArrayLiteral("stream")) {
+            const QString initialValue = QInputDialog::getMultiLineText(
+                this, QStringLiteral("新建 Redis 键"),
+                QStringLiteral("初始值"), {}, &accepted);
+            if (!accepted)
+                return;
+            value = initialValue.toUtf8();
+        } else if (type == QByteArrayLiteral("zset")) {
+            const double score = QInputDialog::getDouble(
+                this, QStringLiteral("新建 Redis Sorted Set"),
+                QStringLiteral("初始分数"), 0.0, -1e100, 1e100, 6,
+                &accepted);
+            if (!accepted)
+                return;
+            value = QByteArray::number(score, 'g', 16);
+        }
+    }
+
+    const int ttlSeconds = QInputDialog::getInt(
+        this, QStringLiteral("新建 Redis 键"),
+        QStringLiteral("TTL（秒，0 表示永久）"), 0, 0, 2147483, 1,
+        &accepted);
+    if (!accepted)
+        return;
+
+    QString error;
+    const QByteArray key = keyText.toUtf8();
+    const qint64 ttlMilliseconds =
+        static_cast<qint64>(ttlSeconds) * 1000;
+    const bool created =
+        type == QByteArrayLiteral("string")
+        ? redis_.createString(key, value, ttlMilliseconds, &error)
+        : redis_.createCollection(
+              type, key, identity, value, ttlMilliseconds, &error);
+    if (!created) {
+        showDatabaseError(QStringLiteral("新建 Redis 键失败"), error);
+        return;
+    }
+    populateSchema();
+    openRedisKey(key);
+}
+
+void MainWindow::filterRedisKeys()
+{
+    if (!redis_.isConnected())
+        return;
+    bool accepted = false;
+    const QString currentPattern =
+        redisBytesAreText(redisKeyPattern_)
+        ? QString::fromUtf8(redisKeyPattern_) : QStringLiteral("*");
+    const QString pattern = QInputDialog::getText(
+        this, QStringLiteral("筛选 Redis 键"),
+        QStringLiteral("SCAN MATCH 模式（例如 nexus:*）"),
+        QLineEdit::Normal, currentPattern, &accepted);
+    if (!accepted)
+        return;
+    const QByteArray encodedPattern =
+        pattern.isEmpty() ? QByteArrayLiteral("*") : pattern.toUtf8();
+    if (encodedPattern.size() > 1024) {
+        QMessageBox::warning(
+            this, QStringLiteral("筛选模式过长"),
+            QStringLiteral("Redis 键筛选模式不能超过 1024 字节。"));
+        return;
+    }
+    redisKeyPattern_ = encodedPattern;
+    populateSchema();
+    statusBar()->showMessage(
+        redisKeyPattern_ == QByteArrayLiteral("*")
+            ? QStringLiteral("已清除 Redis 键筛选")
+            : QStringLiteral("正在显示匹配 %1 的 Redis 键")
+                  .arg(redisDisplayBytes(redisKeyPattern_, 80)),
+        5000);
+}
+
+void MainWindow::openRedisKey(const QByteArray &key)
+{
+    if (key.isEmpty() || !redis_.isConnected())
+        return;
+    for (int index = 0; index < queryTabs_->count(); ++index) {
+        auto *existing =
+            qobject_cast<RedisKeyPage *>(queryTabs_->widget(index));
+        if (existing && existing->key() == key) {
+            queryTabs_->setCurrentIndex(index);
+            existing->refresh();
+            return;
+        }
+    }
+
+    auto *page = new RedisKeyPage(&redis_, key, queryTabs_);
+    const int index = queryTabs_->addTab(
+        page, toolbarIcon(QStringLiteral("redis")),
+        redisDisplayBytes(key, 32));
+    auto *closeButton = new QToolButton(queryTabs_->tabBar());
+    closeButton->setObjectName(QStringLiteral("tabCloseButton"));
+    closeButton->setIcon(toolbarIcon(QStringLiteral("x")));
+    closeButton->setIconSize(QSize(12, 12));
+    closeButton->setAutoRaise(true);
+    closeButton->setFixedSize(18, 18);
+    queryTabs_->tabBar()->setTabButton(
+        index, QTabBar::RightSide, closeButton);
+    connect(closeButton, &QToolButton::clicked, this, [this, page] {
+        closeQuery(queryTabs_->indexOf(page));
+    });
+    connect(page, &RedisKeyPage::keyDeleted, this,
+            [this, page](const QByteArray &) {
+        closeQuery(queryTabs_->indexOf(page));
+        populateSchema();
+        statusBar()->showMessage(QStringLiteral("Redis 键已删除"), 4000);
+    });
+    connect(page, &RedisKeyPage::keyRenamed, this,
+            [this, page](const QByteArray &, const QByteArray &newKey) {
+        const int tabIndex = queryTabs_->indexOf(page);
+        if (tabIndex >= 0)
+            queryTabs_->setTabText(tabIndex, redisDisplayBytes(newKey, 32));
+        populateSchema();
+    });
+    connect(page, &RedisKeyPage::keyMutated, this, [this] {
+        statusBar()->showMessage(QStringLiteral("Redis 数据已更新"), 3000);
+    });
+    queryTabs_->setCurrentIndex(index);
+}
+
+void MainWindow::closeRedisPages()
+{
+    bool removed = false;
+    for (int index = queryTabs_->count() - 1; index >= 0; --index) {
+        QWidget *page = queryTabs_->widget(index);
+        if (!qobject_cast<RedisKeyPage *>(page))
+            continue;
+        queryTabs_->removeTab(index);
+        page->deleteLater();
+        removed = true;
+    }
+    if (removed && queryTabs_->count() == 0)
+        addQuery();
+}
+
 void MainWindow::showConnectionContextMenu(const QPoint &position)
 {
     const QModelIndex proxyIndex = schemaTree_->indexAt(position);
     if (!proxyIndex.isValid())
         return;
     schemaTree_->setCurrentIndex(proxyIndex);
+    const QModelIndex sourceIndex =
+        schemaProxy_->mapToSource(proxyIndex);
+    const QString driver = driverForIndex(sourceIndex);
+    const QString type = sourceIndex.data(TypeRole).toString();
     const QString connectionId = selectedConnectionId();
+
+    if (driver == QStringLiteral("redis")) {
+        QMenu menu(schemaTree_);
+        if (type == QStringLiteral("redis-key")) {
+            const QByteArray key =
+                sourceIndex.data(RedisKeyRole).toByteArray();
+            QAction *openAction = menu.addAction(QStringLiteral("打开键"));
+            connect(openAction, &QAction::triggered, this,
+                    [this, key] { openRedisKey(key); });
+            QAction *deleteAction = menu.addAction(QStringLiteral("删除键"));
+            connect(deleteAction, &QAction::triggered, this, [this, key] {
+                if (QMessageBox::question(
+                        this, QStringLiteral("删除 Redis 键"),
+                        QStringLiteral("确定删除 %1？此操作无法撤销。")
+                            .arg(redisDisplayBytes(key, 180)))
+                    != QMessageBox::Yes) {
+                    return;
+                }
+                QString error;
+                if (!redis_.deleteKey(key, &error)) {
+                    showDatabaseError(QStringLiteral("删除 Redis 键失败"), error);
+                    return;
+                }
+                populateSchema();
+            });
+            menu.addSeparator();
+        }
+        if (redis_.isConnected()) {
+            QAction *createAction =
+                menu.addAction(QStringLiteral("新建 Redis 键"));
+            if (type == QStringLiteral("redis-database")) {
+                createAction->setEnabled(
+                    sourceIndex.data(RedisDatabaseRole).toInt()
+                    == redis_.config().database);
+            }
+            connect(createAction, &QAction::triggered,
+                    this, &MainWindow::createRedisKey);
+            QAction *filterAction =
+                menu.addAction(QStringLiteral("筛选键…"));
+            if (type == QStringLiteral("redis-database")) {
+                filterAction->setEnabled(
+                    sourceIndex.data(RedisDatabaseRole).toInt()
+                    == redis_.config().database);
+            }
+            connect(filterAction, &QAction::triggered,
+                    this, &MainWindow::filterRedisKeys);
+            QAction *refreshAction =
+                menu.addAction(QStringLiteral("刷新键空间"));
+            connect(refreshAction, &QAction::triggered,
+                    this, &MainWindow::refreshSchema);
+        }
+        if (!connectionId.isEmpty()
+            && (type == QStringLiteral("redis-connection")
+                || menu.actions().isEmpty())) {
+            if (!menu.actions().isEmpty())
+                menu.addSeparator();
+            QAction *connectAction = menu.addAction(QStringLiteral("连接"));
+            connectAction->setEnabled(
+                !redis_.isConnected()
+                || connectionId != activeRedisConnectionId_);
+            connect(connectAction, &QAction::triggered,
+                    this, &MainWindow::connectSelectedConnection);
+            QAction *editAction =
+                menu.addAction(QStringLiteral("编辑连接"));
+            connect(editAction, &QAction::triggered,
+                    this, &MainWindow::editSelectedConnection);
+            menu.addSeparator();
+            QAction *removeAction =
+                menu.addAction(QStringLiteral("删除已保存连接"));
+            connect(removeAction, &QAction::triggered,
+                    this, &MainWindow::removeSelectedConnection);
+        }
+        if (!menu.actions().isEmpty())
+            menu.exec(schemaTree_->viewport()->mapToGlobal(position));
+        return;
+    }
+
     if (connectionId.isEmpty())
         return;
 
@@ -1628,6 +2954,47 @@ void MainWindow::showConnectionContextMenu(const QPoint &position)
 void MainWindow::removeSelectedConnection()
 {
     const QString connectionId = selectedConnectionId();
+    if (selectedConnectionDriver() == QStringLiteral("redis")) {
+        SavedRedisConnection *connection =
+            savedRedisConnection(connectionId);
+        if (!connection) {
+            statusBar()->showMessage(
+                QStringLiteral("请先选择要删除的已保存 Redis 连接"), 4000);
+            return;
+        }
+        const QString displayName = connection->config.displayName();
+        if (QMessageBox::question(
+                this, QStringLiteral("删除已保存 Redis 连接"),
+                QStringLiteral("确定删除 %1？\n保存的密码也会从系统凭据存储中移除。")
+                    .arg(displayName))
+            != QMessageBox::Yes) {
+            return;
+        }
+        QSettings settings;
+        QString error;
+        if (!RedisConnectionStore::remove(
+                settings, *credentialStore_, connectionId, &error)) {
+            showDatabaseError(QStringLiteral("删除 Redis 连接失败"), error);
+            return;
+        }
+        if (connectionId == activeRedisConnectionId_) {
+            closeRedisPages();
+            redis_.disconnect();
+            activeRedisConnectionId_.clear();
+        }
+        for (qsizetype index = 0;
+             index < savedRedisConnections_.size(); ++index) {
+            if (savedRedisConnections_.at(index).id == connectionId) {
+                savedRedisConnections_.removeAt(index);
+                break;
+            }
+        }
+        refreshConnectionPresentation();
+        statusBar()->showMessage(
+            QStringLiteral("已删除 %1").arg(displayName), 5000);
+        return;
+    }
+
     SavedConnection *connection = savedConnection(connectionId);
     if (!connection) {
         statusBar()->showMessage(QStringLiteral("请先选择要删除的已保存连接"), 4000);
@@ -1675,6 +3042,17 @@ QString MainWindow::connectionIdForIndex(QModelIndex sourceIndex) const
     return {};
 }
 
+QString MainWindow::driverForIndex(QModelIndex sourceIndex) const
+{
+    while (sourceIndex.isValid()) {
+        const QString driver = sourceIndex.data(DriverRole).toString();
+        if (!driver.isEmpty())
+            return driver;
+        sourceIndex = sourceIndex.parent();
+    }
+    return {};
+}
+
 QString MainWindow::selectedConnectionId() const
 {
     const QModelIndex proxyIndex = schemaTree_->currentIndex();
@@ -1684,10 +3062,29 @@ QString MainWindow::selectedConnectionId() const
         schemaProxy_->mapToSource(proxyIndex));
 }
 
+QString MainWindow::selectedConnectionDriver() const
+{
+    const QModelIndex proxyIndex = schemaTree_->currentIndex();
+    if (proxyIndex.isValid()) {
+        const QString driver = driverForIndex(
+            schemaProxy_->mapToSource(proxyIndex));
+        if (!driver.isEmpty())
+            return driver;
+    }
+    if (!focusedDriver_.isEmpty())
+        return focusedDriver_;
+    if (postgres_.isConnected() || !activeConnectionId_.isEmpty())
+        return QStringLiteral("postgresql");
+    if (redis_.isConnected() || !activeRedisConnectionId_.isEmpty())
+        return QStringLiteral("redis");
+    return {};
+}
+
 QString MainWindow::preferredConnectionId() const
 {
     const QString selected = selectedConnectionId();
-    if (!selected.isEmpty())
+    if (!selected.isEmpty()
+        && selectedConnectionDriver() == QStringLiteral("postgresql"))
         return selected;
     if (!activeConnectionId_.isEmpty())
         return activeConnectionId_;
@@ -1711,6 +3108,60 @@ const SavedConnection *MainWindow::savedConnection(
             return &connection;
     }
     return nullptr;
+}
+
+SavedRedisConnection *MainWindow::savedRedisConnection(
+    const QString &connectionId)
+{
+    for (SavedRedisConnection &connection : savedRedisConnections_) {
+        if (connection.id == connectionId)
+            return &connection;
+    }
+    return nullptr;
+}
+
+const SavedRedisConnection *MainWindow::savedRedisConnection(
+    const QString &connectionId) const
+{
+    for (const SavedRedisConnection &connection : savedRedisConnections_) {
+        if (connection.id == connectionId)
+            return &connection;
+    }
+    return nullptr;
+}
+
+void MainWindow::disconnectActiveConnection()
+{
+    const QString driver = selectedConnectionDriver();
+    if (driver == QStringLiteral("redis") && redis_.isConnected()) {
+        closeRedisPages();
+        redis_.disconnect();
+        return;
+    }
+    if (driver == QStringLiteral("postgresql") && postgres_.isConnected()) {
+        cancelRunningQuery();
+        const QModelIndex sourceIndex = schemaProxy_->mapToSource(
+            schemaTree_->currentIndex());
+        const QString database =
+            postgresDatabaseForIndex(sourceIndex);
+        if (!database.isEmpty()) {
+            if (!postgres_.disconnectDatabase(database))
+                return;
+            if (postgres_.isConnected()
+                && !activeConnectionId_.isEmpty()) {
+                QString saveError;
+                if (!persistActiveConnectionConfig(&saveError)) {
+                    statusBar()->showMessage(
+                        QStringLiteral(
+                            "数据库已断开，但无法保存新的默认数据库：%1")
+                            .arg(saveError),
+                        5000);
+                }
+            }
+            return;
+        }
+        postgres_.disconnect();
+    }
 }
 
 void MainWindow::showDatabaseError(const QString &title, const QString &error)

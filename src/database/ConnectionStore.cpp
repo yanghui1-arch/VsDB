@@ -32,7 +32,7 @@ public:
     bool write(const QString &key, const QString &secret, QString *error) override
     {
         std::wstring target = key.toStdWString();
-        std::wstring comment = QStringLiteral("VsDB PostgreSQL connection password").toStdWString();
+        std::wstring comment = QStringLiteral("VsDB database connection password").toStdWString();
         CREDENTIALW credential{};
         credential.Type = CRED_TYPE_GENERIC;
         credential.TargetName = target.data();

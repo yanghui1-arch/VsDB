@@ -345,9 +345,23 @@ void QueryPage::setStatus(const QString &message)
     messages_->setPlainText(message);
 }
 
-void QueryPage::setTableContext(const QString &schema, const QString &table,
+void QueryPage::setDatabaseContext(const QString &database)
+{
+    databaseContext_ = database;
+}
+
+QString QueryPage::databaseContext() const
+{
+    return databaseContext_;
+}
+
+void QueryPage::setTableContext(const QString &database,
+                                const QString &schema,
+                                const QString &table,
                                 const QStringList &primaryKeys)
 {
+    databaseContext_ = database;
+    tableDatabase_ = database;
     tableSchema_ = schema;
     tableName_ = table;
     primaryKeys_ = primaryKeys;
@@ -355,9 +369,15 @@ void QueryPage::setTableContext(const QString &schema, const QString &table,
 
 void QueryPage::clearTableContext()
 {
+    tableDatabase_.clear();
     tableSchema_.clear();
     tableName_.clear();
     primaryKeys_.clear();
+}
+
+QString QueryPage::tableDatabase() const
+{
+    return tableDatabase_;
 }
 
 QString QueryPage::tableSchema() const

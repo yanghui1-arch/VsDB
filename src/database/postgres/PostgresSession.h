@@ -2,7 +2,9 @@
 
 #include "database/DatabaseTypes.h"
 
+#include <QHash>
 #include <QString>
+#include <QStringList>
 
 namespace vsdb {
 
@@ -18,7 +20,10 @@ public:
     bool connectToServer(const PostgresConnectionConfig &config, QString *error);
     bool reconnect(QString *error);
     void disconnect();
+    bool disconnectDatabase(const QString &database);
     bool isConnected() const;
+    bool isDatabaseConnected(const QString &database) const;
+    QStringList connectedDatabases() const;
 
     const PostgresConnectionConfig &config() const;
     QString currentUser() const;
@@ -49,11 +54,22 @@ public:
     QString qualifiedName(const QString &schema, const QString &relation) const;
 
 private:
-    bool openDatabase(const QString &database, QString *error);
+    bool activateDatabase(const QString &database, const QString &sessionUser,
+                          QString *error);
+    bool openDatabaseConnection(const PostgresConnectionConfig &config,
+                                const QString &database,
+                                const QString &sessionUser,
+                                QString *connectionName, QString *error);
+    bool reopenActiveDatabase(QString *error);
+    void closeAndRemoveConnection(const QString &connectionName);
+    bool hasSameServerIdentity(const PostgresConnectionConfig &config) const;
     bool setSessionUser(const QString &user, QString *error);
     QString databaseError() const;
 
-    QString connectionName_;
+    QString connectionPrefix_;
+    QString activeConnectionName_;
+    QHash<QString, QString> databaseConnections_;
+    QHash<QString, QString> databaseUsers_;
     PostgresConnectionConfig config_;
     QString currentUser_;
     bool configured_ = false;

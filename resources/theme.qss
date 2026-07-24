@@ -1,6 +1,6 @@
 * { color: #E7E8ED; font-size: 13px; }
 QMainWindow, QWidget#appRoot { background: #17181E; }
-QWidget#workbench, QWidget#queryPage { background: #20212A; }
+QWidget#workbench, QWidget#queryPage, QWidget#redisKeyPage { background: #20212A; }
 QWidget#sidePane { background: #1B1C23; }
 QWidget#topBar, QWidget#bottomBar { background: #1D1E25; }
 QWidget#topBar { border-bottom: 1px solid #353742; }
@@ -46,6 +46,7 @@ QHeaderView::section { color: #B7BAC5; background: #24252E; border: none; border
 QHeaderView { background: #24252E; }
 QTableCornerButton::section { background: #24252E; border: none; border-right: 1px solid #30323C; border-bottom: 1px solid #30323C; }
 QPlainTextEdit#sqlEditor { color: #D6D7DD; background: #1C1D23; border: none; selection-background-color: #264F78; selection-color: #E7E8ED; }
+QPlainTextEdit#redisValueEditor { color: #D6D7DD; background: #1C1D23; border: 1px solid #353742; border-radius: 6px; padding: 8px; selection-background-color: #264F78; selection-color: #E7E8ED; }
 QTabWidget::pane { border: none; }
 QTabBar { background: #1D1E25; border: none; qproperty-drawBase: false; }
 QTabBar::tab { color: #A3A6B2; background: #1D1E25; border: none; min-height: 37px; min-width: 82px; padding: 0 14px; }

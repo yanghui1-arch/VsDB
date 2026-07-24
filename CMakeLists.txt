@@ -9,7 +9,7 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg Sql)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Network Svg Sql)
 set(CMAKE_AUTOMOC ON)
 
 qt_add_executable(VsDB
@@ -29,19 +29,29 @@ qt_add_executable(VsDB
     src/database/postgres/PostgresQueryWorker.h
     src/database/postgres/PostgresSession.cpp
     src/database/postgres/PostgresSession.h
+    src/database/redis/RedisConnectionStore.cpp
+    src/database/redis/RedisConnectionStore.h
+    src/database/redis/RedisProtocol.cpp
+    src/database/redis/RedisProtocol.h
+    src/database/redis/RedisSession.cpp
+    src/database/redis/RedisSession.h
     src/ui/IconProvider.cpp
     src/ui/IconProvider.h
     src/ui/PostgresConnectionDialog.cpp
     src/ui/PostgresConnectionDialog.h
     src/ui/QueryPage.cpp
     src/ui/QueryPage.h
+    src/ui/RedisConnectionDialog.cpp
+    src/ui/RedisConnectionDialog.h
+    src/ui/RedisKeyPage.cpp
+    src/ui/RedisKeyPage.h
 )
 
 target_include_directories(VsDB PRIVATE src)
 
 configure_file(resources/theme.qss theme.qss COPYONLY)
 
-target_link_libraries(VsDB PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::Sql)
+target_link_libraries(VsDB PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Svg Qt6::Sql)
 if(WIN32)
     target_link_libraries(VsDB PRIVATE advapi32)
 endif()
@@ -130,4 +140,34 @@ if(BUILD_TESTING)
         target_link_libraries(VsDBConnectionStoreTests PRIVATE advapi32)
     endif()
     add_test(NAME VsDB.ConnectionStore COMMAND VsDBConnectionStoreTests)
+
+    add_executable(VsDBRedisTests
+        tests/RedisProtocolTest.cpp
+        src/database/redis/RedisProtocol.cpp
+        src/database/redis/RedisProtocol.h
+        src/database/redis/RedisSession.cpp
+        src/database/redis/RedisSession.h
+    )
+    target_include_directories(VsDBRedisTests PRIVATE src)
+    target_link_libraries(VsDBRedisTests PRIVATE Qt6::Core Qt6::Network)
+    add_test(NAME VsDB.Redis COMMAND VsDBRedisTests)
+
+    add_executable(VsDBRedisConnectionStoreTests
+        tests/RedisConnectionStoreTest.cpp
+        src/database/ConnectionStore.cpp
+        src/database/ConnectionStore.h
+        src/database/DatabaseTypes.h
+        src/database/redis/RedisConnectionStore.cpp
+        src/database/redis/RedisConnectionStore.h
+        src/database/redis/RedisProtocol.cpp
+        src/database/redis/RedisProtocol.h
+        src/database/redis/RedisSession.cpp
+        src/database/redis/RedisSession.h
+    )
+    target_include_directories(VsDBRedisConnectionStoreTests PRIVATE src)
+    target_link_libraries(VsDBRedisConnectionStoreTests PRIVATE Qt6::Core Qt6::Network)
+    if(WIN32)
+        target_link_libraries(VsDBRedisConnectionStoreTests PRIVATE advapi32)
+    endif()
+    add_test(NAME VsDB.RedisConnectionStore COMMAND VsDBRedisConnectionStoreTests)
 endif()
