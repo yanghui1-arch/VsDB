@@ -175,7 +175,13 @@ int main(int argc, char *argv[])
     vsdb::QueryResult switchedDatabase = session.execute(QStringLiteral("SELECT current_database()"), 1, &error);
     if (!error.isEmpty() || switchedDatabase.rows.constFirst().constFirst().toString() != database)
         return fail(18, QStringLiteral("current database mismatch: %1").arg(error));
+    if (!session.isDatabaseConnected(config.database)
+        || !session.isDatabaseConnected(database)
+        || session.connectedDatabases().size() < 2)
+        return fail(23, QStringLiteral("parallel database sessions were not retained"));
     if (!session.switchDatabase(config.database, &error)
+        || !session.disconnectDatabase(database)
+        || session.isDatabaseConnected(database)
         || !exec(session, QStringLiteral("DROP DATABASE %1").arg(session.quoteIdentifier(database)), &error))
         return fail(19, QStringLiteral("database cleanup failed: %1").arg(error));
 

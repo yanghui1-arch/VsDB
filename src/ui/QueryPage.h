@@ -40,9 +40,13 @@ public:
     void setQueryResult(QueryResult result, bool editable);
     void setStatus(const QString &message);
 
-    void setTableContext(const QString &schema, const QString &table,
+    void setDatabaseContext(const QString &database);
+    QString databaseContext() const;
+    void setTableContext(const QString &database, const QString &schema,
+                         const QString &table,
                          const QStringList &primaryKeys);
     void clearTableContext();
+    QString tableDatabase() const;
     QString tableSchema() const;
     QString tableName() const;
     QStringList primaryKeys() const;
@@ -67,6 +71,8 @@ private:
     QElapsedTimer elapsed_;
     bool executing_ = false;
     bool selectResult_ = false;
+    QString databaseContext_;
+    QString tableDatabase_;
     QString tableSchema_;
     QString tableName_;
     QStringList primaryKeys_;

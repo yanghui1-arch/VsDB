@@ -2,6 +2,8 @@
 
 #include "database/ConnectionStore.h"
 #include "database/postgres/PostgresSession.h"
+#include "database/redis/RedisConnectionStore.h"
+#include "database/redis/RedisSession.h"
 
 #include <QMainWindow>
 #include <QPointer>
@@ -26,6 +28,7 @@ namespace vsdb {
 
 class QueryPage;
 class PostgresQueryWorker;
+class RedisKeyPage;
 
 class MainWindow final : public QMainWindow
 {
@@ -33,6 +36,7 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
     bool connectToPostgres(const PostgresConnectionConfig &config, QString *error);
+    bool connectToRedis(const RedisConnectionConfig &config, QString *error);
     bool openRelationPreview(const QString &schema, const QString &relation, QString *error);
 
 protected:
@@ -45,15 +49,24 @@ private:
     void createDatabaseToolBar();
     void populateSchema();
     void populateActiveConnection(QStandardItem *root);
+    void populateActiveRedisConnection(QStandardItem *root);
+    bool selectPostgresDatabaseInTree(const QString &database);
+    bool selectRedisDatabaseInTree(int database);
+    QString postgresDatabaseForIndex(const QModelIndex &sourceIndex) const;
+    bool activatePostgresDatabase(const QString &database, QString *error);
+    void updatePostgresDatabaseAppearance();
     void populateCachedConnection(QStandardItem *root,
                                   const SavedConnection &connection);
     void updateConnectionSnapshot(QStandardItem *users,
                                   QStandardItem *databases);
     void loadSchemaChildren(QStandardItem *item);
+    void loadRedisKeys(QStandardItem *item, const QByteArray &cursor,
+                       bool append);
     void installActions();
     void updateInspector(const QString &name, const QString &type,
                          const QString &schema = {});
     void updateInspector(const SavedConnection &connection, bool connected);
+    void updateInspector(const SavedRedisConnection &connection, bool connected);
     void updateInspector(const DatabaseTable &table);
     void clearInspectorModels();
     void addQuery(const QString &sql = {});
@@ -64,6 +77,7 @@ private:
     void updateConnectionUi();
     void refreshConnectionPresentation();
     void showPostgresConnectionDialog();
+    void showRedisConnectionDialog();
     void editSelectedConnection();
     bool editConnection(
         const QString &connectionId, const QString &notice = {},
@@ -72,14 +86,29 @@ private:
     void connectSavedConnection(const QString &connectionId,
                                 const QString &database = {});
     bool persistActiveConnectionConfig(QString *error);
+    bool editRedisConnection(
+        const QString &connectionId, const QString &notice = {},
+        const std::optional<RedisConnectionConfig> &initialConfig = std::nullopt);
+    void connectSavedRedisConnection(const QString &connectionId);
+    bool persistActiveRedisConnectionConfig(QString *error);
+    void createRedisKey();
+    void filterRedisKeys();
+    void openRedisKey(const QByteArray &key);
+    void closeRedisPages();
     void removeSelectedConnection();
     void showConnectionContextMenu(const QPoint &position);
     QString connectionIdForIndex(QModelIndex sourceIndex) const;
+    QString driverForIndex(QModelIndex sourceIndex) const;
     QString selectedConnectionId() const;
+    QString selectedConnectionDriver() const;
     QString preferredConnectionId() const;
     SavedConnection *savedConnection(const QString &connectionId);
     const SavedConnection *savedConnection(const QString &connectionId) const;
+    SavedRedisConnection *savedRedisConnection(const QString &connectionId);
+    const SavedRedisConnection *savedRedisConnection(
+        const QString &connectionId) const;
     void showDatabaseError(const QString &title, const QString &error);
+    void disconnectActiveConnection();
 
 private:
     void executeQuery();
@@ -91,9 +120,14 @@ private:
     void applyPendingChanges(QueryPage *page);
 
     PostgresSession postgres_;
+    RedisSession redis_;
     std::unique_ptr<CredentialStore> credentialStore_;
     QVector<SavedConnection> savedConnections_;
+    QVector<SavedRedisConnection> savedRedisConnections_;
     QString activeConnectionId_;
+    QString activeRedisConnectionId_;
+    QString focusedDriver_;
+    QByteArray redisKeyPattern_ = QByteArrayLiteral("*");
     QThread *queryThread_ = nullptr;
     PostgresQueryWorker *queryWorker_ = nullptr;
     QPointer<QueryPage> runningQueryPage_;
