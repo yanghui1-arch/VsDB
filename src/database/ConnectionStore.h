@@ -14,8 +14,11 @@ namespace vsdb {
 
 struct ConnectionSnapshot
 {
+    // Server-wide lists remain useful regardless of the database selected later.
     QStringList users;
     QStringList databases;
+
+    // These details belong to SavedConnection::config.database.
     QStringList schemas;
     QStringList publicTables;
     QStringList publicViews;
@@ -24,6 +27,7 @@ struct ConnectionSnapshot
 struct SavedConnection
 {
     QString id;
+    // QSettings stores only non-sensitive fields; password comes from CredentialStore.
     PostgresConnectionConfig config;
     ConnectionSnapshot snapshot;
     bool hasStoredPassword = false;

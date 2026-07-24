@@ -685,7 +685,7 @@ void MainWindow::populateSchema()
         populateActiveConnection(root);
     } else if (!selectedRoot) {
         selectedRoot = schemaItem(
-            QStringLiteral("尚无已保存连接，点击下方＋添加"),
+            QStringLiteral("尚无已保存连接，点击左上角数据库图标添加"),
             QStringLiteral("empty"), QStringLiteral("postgresql"),
             QStringLiteral("PostgreSQL"));
         schemaModel_->appendRow(selectedRoot);
@@ -815,6 +815,7 @@ void MainWindow::updateConnectionSnapshot(
     QStandardItem *users, QStandardItem *databases)
 {
     SavedConnection *connection = savedConnection(activeConnectionId_);
+    // Session-only connections must not overwrite a saved profile's cached tree.
     if (!connection
         || connection->config.database != postgres_.config().database) {
         return;
@@ -1525,7 +1526,14 @@ void MainWindow::connectSelectedConnection()
         showPostgresConnectionDialog();
         return;
     }
-    connectSavedConnection(connectionId);
+
+    const QModelIndex sourceIndex =
+        schemaProxy_->mapToSource(schemaTree_->currentIndex());
+    const QString database =
+        sourceIndex.data(TypeRole).toString() == QStringLiteral("database")
+        ? sourceIndex.data(NameRole).toString()
+        : QString{};
+    connectSavedConnection(connectionId, database);
 }
 
 void MainWindow::connectSavedConnection(
@@ -1538,10 +1546,11 @@ void MainWindow::connectSavedConnection(
         statusBar()->showMessage(QStringLiteral("该数据库已经连接"), 3000);
         return;
     }
+
+    PostgresConnectionConfig config = stored->config;
+    if (!database.isEmpty())
+        config.database = database;
     if (!stored->hasStoredPassword) {
-        PostgresConnectionConfig config = stored->config;
-        if (!database.isEmpty())
-            config.database = database;
         editConnection(
             connectionId,
             QStringLiteral("没有找到此连接的已保存密码，请重新输入连接信息。"),
@@ -1549,9 +1558,6 @@ void MainWindow::connectSavedConnection(
         return;
     }
 
-    PostgresConnectionConfig config = stored->config;
-    if (!database.isEmpty())
-        config.database = database;
     cancelRunningQuery();
     QApplication::setOverrideCursor(Qt::WaitCursor);
     QString error;
@@ -1582,8 +1588,11 @@ void MainWindow::connectSavedConnection(
 bool MainWindow::persistActiveConnectionConfig(QString *error)
 {
     SavedConnection *connection = savedConnection(activeConnectionId_);
-    if (!connection)
-        return true;
+    if (!connection) {
+        if (error)
+            *error = QStringLiteral("当前连接尚未保存。");
+        return false;
+    }
     connection->config = postgres_.config();
     QSettings settings;
     return ConnectionStore::upsert(
@@ -1604,11 +1613,11 @@ void MainWindow::showConnectionContextMenu(const QPoint &position)
     QAction *connectAction = menu.addAction(QStringLiteral("连接"));
     connectAction->setEnabled(
         !postgres_.isConnected() || connectionId != activeConnectionId_);
-    connect(connectAction, &QAction::triggered, this,
-            [this, connectionId] { connectSavedConnection(connectionId); });
+    connect(connectAction, &QAction::triggered,
+            this, &MainWindow::connectSelectedConnection);
     QAction *editAction = menu.addAction(QStringLiteral("编辑连接"));
-    connect(editAction, &QAction::triggered, this,
-            [this, connectionId] { editConnection(connectionId); });
+    connect(editAction, &QAction::triggered,
+            this, &MainWindow::editSelectedConnection);
     menu.addSeparator();
     QAction *removeAction = menu.addAction(QStringLiteral("删除已保存连接"));
     connect(removeAction, &QAction::triggered,
@@ -1668,10 +1677,11 @@ QString MainWindow::connectionIdForIndex(QModelIndex sourceIndex) const
 
 QString MainWindow::selectedConnectionId() const
 {
-    if (!schemaTree_ || !schemaTree_->currentIndex().isValid())
+    const QModelIndex proxyIndex = schemaTree_->currentIndex();
+    if (!proxyIndex.isValid())
         return {};
     return connectionIdForIndex(
-        schemaProxy_->mapToSource(schemaTree_->currentIndex()));
+        schemaProxy_->mapToSource(proxyIndex));
 }
 
 QString MainWindow::preferredConnectionId() const

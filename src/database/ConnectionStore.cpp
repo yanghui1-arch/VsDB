@@ -222,6 +222,7 @@ bool ConnectionStore::upsert(QSettings &settings, CredentialStore &credentials,
     if (isNew)
         connection.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
+    // Write the secret first so metadata never points to an unsecured password.
     if (!credentials.write(credentialKey(connection.id),
                            connection.config.password, error)) {
         if (isNew)
@@ -289,6 +290,7 @@ bool ConnectionStore::remove(QSettings &settings, CredentialStore &credentials,
         assignError(error, QStringLiteral("没有选择要删除的连接。"));
         return false;
     }
+    // Remove the secret first so a settings failure cannot leave an orphaned password.
     if (!credentials.remove(credentialKey(connectionId), error))
         return false;
 
