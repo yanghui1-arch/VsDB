@@ -1,9 +1,12 @@
 #pragma once
 
+#include "database/ConnectionStore.h"
 #include "database/postgres/PostgresSession.h"
 
 #include <QMainWindow>
 #include <QPointer>
+
+#include <memory>
 
 class QAction;
 class QComboBox;
@@ -43,6 +46,7 @@ private:
     void installActions();
     void updateInspector(const QString &name, const QString &type,
                          const QString &schema = {});
+    void updateInspector(const SavedConnection &connection, bool connected);
     void updateInspector(const DatabaseTable &table);
     void clearInspectorModels();
     void addQuery(const QString &sql = {});
@@ -52,6 +56,14 @@ private:
     void cancelRunningQuery();
     void updateConnectionUi();
     void showPostgresConnectionDialog();
+    void editSelectedConnection();
+    void editConnection(const QString &connectionId, const QString &notice = {});
+    void connectSelectedConnection();
+    void connectSavedConnection(const QString &connectionId);
+    void removeSelectedConnection();
+    QString selectedConnectionId() const;
+    SavedConnection *savedConnection(const QString &connectionId);
+    const SavedConnection *savedConnection(const QString &connectionId) const;
     void showDatabaseError(const QString &title, const QString &error);
 
 private:
@@ -64,6 +76,9 @@ private:
     void applyPendingChanges(QueryPage *page);
 
     PostgresSession postgres_;
+    std::unique_ptr<CredentialStore> credentialStore_;
+    QVector<SavedConnection> savedConnections_;
+    QString activeConnectionId_;
     QThread *queryThread_ = nullptr;
     PostgresQueryWorker *queryWorker_ = nullptr;
     QPointer<QueryPage> runningQueryPage_;

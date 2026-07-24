@@ -7,7 +7,6 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
-#include <QSettings>
 #include <QSpinBox>
 #include <QUrl>
 #include <QUrlQuery>
@@ -23,7 +22,7 @@ PostgresConnectionDialog::PostgresConnectionDialog(QWidget *parent)
 
     auto *root = new QVBoxLayout(this);
     auto *hint = new QLabel(QStringLiteral(
-        "可填写主机名，也可直接粘贴 postgresql:// 连接地址。密码只在当前进程内使用，不会写入配置。"),
+        "可填写主机名，也可直接粘贴 postgresql:// 连接地址。连接成功后，密码将安全保存到 Windows 凭据管理器。"),
         this);
     hint->setWordWrap(true);
     hint->setObjectName(QStringLiteral("muted"));
@@ -40,6 +39,7 @@ PostgresConnectionDialog::PostgresConnectionDialog(QWidget *parent)
     form->addRow(QStringLiteral("端口"), port_);
 
     user_ = new QLineEdit(this);
+    user_->setText(QStringLiteral("postgres"));
     form->addRow(QStringLiteral("用户"), user_);
 
     password_ = new QLineEdit(this);
@@ -70,17 +70,7 @@ PostgresConnectionDialog::PostgresConnectionDialog(QWidget *parent)
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     root->addWidget(buttons);
 
-    QSettings settings;
-    address_->setText(settings.value(QStringLiteral("postgres/host"),
-                                     QStringLiteral("localhost")).toString());
-    port_->setValue(settings.value(QStringLiteral("postgres/port"), 5432).toInt());
-    user_->setText(settings.value(QStringLiteral("postgres/user"),
-                                  QStringLiteral("postgres")).toString());
-    database_->setText(settings.value(QStringLiteral("postgres/database"),
-                                      QStringLiteral("postgres")).toString());
-    sslMode_->setCurrentText(settings.value(QStringLiteral("postgres/sslMode"),
-                                            QStringLiteral("prefer")).toString());
-    timeout_->setValue(settings.value(QStringLiteral("postgres/connectTimeout"), 10).toInt());
+    address_->setText(QStringLiteral("localhost"));
 }
 
 void PostgresConnectionDialog::setConfig(const PostgresConnectionConfig &config)
@@ -136,13 +126,6 @@ void PostgresConnectionDialog::accept()
         return;
     }
 
-    QSettings settings;
-    settings.setValue(QStringLiteral("postgres/host"), value.host);
-    settings.setValue(QStringLiteral("postgres/port"), value.port);
-    settings.setValue(QStringLiteral("postgres/user"), value.user);
-    settings.setValue(QStringLiteral("postgres/database"), value.database);
-    settings.setValue(QStringLiteral("postgres/sslMode"), value.sslMode);
-    settings.setValue(QStringLiteral("postgres/connectTimeout"), value.connectTimeoutSeconds);
     QDialog::accept();
 }
 
